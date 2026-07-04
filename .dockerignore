@@ -1,0 +1,13 @@
+.git
+dist
+publish
+desktop-client/build
+desktop-client/frontend/node_modules
+desktop-client/frontend/dist
+*.zip
+*.exe
+*.log
+config.yml
+credentials*.json
+.workbuddy
+.claude

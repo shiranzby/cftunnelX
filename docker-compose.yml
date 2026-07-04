@@ -1,0 +1,20 @@
+services:
+  cftunnelx:
+    build: .
+    image: cftunnelx:v4.3
+    container_name: cftunnelx
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    volumes:
+      - cftunnelx-config:/app/config
+      - cftunnelx-log:/app/log
+    environment:
+      CFTUNNEL_API_TOKEN: ${CFTUNNEL_API_TOKEN:-}
+      CFTUNNEL_ACCOUNT_ID: ${CFTUNNEL_ACCOUNT_ID:-}
+      CFTUNNEL_RELAY_SERVER: ${CFTUNNEL_RELAY_SERVER:-}
+      CFTUNNEL_RELAY_TOKEN: ${CFTUNNEL_RELAY_TOKEN:-}
+
+volumes:
+  cftunnelx-config:
+  cftunnelx-log:

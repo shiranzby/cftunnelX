@@ -1,0 +1,7 @@
+# cftunnel 中继服务端配置
+# 使用前请将此文件复制为 frps.toml 并修改 auth.token
+#
+# 完整配置参考: https://github.com/fatedier/frp/blob/dev/conf/frps_full_example.toml
+
+bindPort = 7000
+auth.token = "请替换为你的密钥"

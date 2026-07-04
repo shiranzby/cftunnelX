@@ -1,0 +1,17 @@
+# cftunnel 中继服务端 Docker 部署
+# 用法:
+#   1. 复制 frps.toml.example 为 frps.toml，修改 auth.token
+#   2. docker compose up -d
+#
+# 端口说明:
+#   7000        — frps 控制端口（客户端连接用）
+#   6000-6100   — 穿透端口范围（按需调整）
+
+services:
+  frps:
+    image: snowdreamtech/frps:0.66.0
+    container_name: cftunnel-relay
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./frps.toml:/etc/frp/frps.toml:ro
