@@ -218,6 +218,7 @@ jobs:
     needs: [cli, windows-gui, wails, docker, openwrt-ipk]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -228,4 +229,5 @@ jobs:
           for d in *; do zip -r "../${d}.zip" "$d"; done
       - uses: softprops/action-gh-release@v2
         with:
-          files: "*.zip"
+          files: |
+            ./*.zip

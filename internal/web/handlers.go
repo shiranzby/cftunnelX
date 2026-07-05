@@ -2168,6 +2168,12 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if _, err := os.Stat(logPath); err != nil {
+		ensureBootLog(s.version, s.listenPort())
+	} else if info, err := os.Stat(logPath); err == nil && info.Size() == 0 {
+		ensureBootLog(s.version, s.listenPort())
+	}
+
 	lines, err := readLogTailLines(logPath, limit)
 	if err != nil {
 		writeOK(w, map[string]interface{}{

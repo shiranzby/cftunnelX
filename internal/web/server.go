@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -30,6 +32,7 @@ type Server struct {
 	srv     *http.Server
 	version string
 	started time.Time
+	authKey string
 }
 
 // NewServer 创建 Web UI 服务器
@@ -39,6 +42,7 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 		mux:     http.NewServeMux(),
 		version: version,
 		started: time.Now(),
+		authKey: newAuthKey(),
 	}
 
 	// 确保 WebUI 配置有默认值
@@ -50,12 +54,13 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 	}
 
 	s.registerRoutes()
-	logLine("WebUI \u521d\u59cb\u5316: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
+	ensureBootLog(version, port)
+	logLine("WebUI 初始化: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
 	ips := localIPs()
 	if len(ips) == 0 {
-		logLine("\u7f51\u7edc\u72b6\u6001: \u672a\u68c0\u6d4b\u5230\u53ef\u7528\u672c\u673a IP")
+		logLine("网络状态: 未检测到可用本机 IP")
 	} else {
-		logLine("\u7f51\u7edc\u72b6\u6001: \u672c\u673a IP %s", strings.Join(ips, ", "))
+		logLine("网络状态: 本机 IP %s", strings.Join(ips, ", "))
 	}
 
 	s.srv = &http.Server{
@@ -69,6 +74,8 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 func (s *Server) registerRoutes() {
 	// SPA 主页
 	s.mux.HandleFunc("/", s.handleIndex)
+	s.mux.HandleFunc("/login", s.handleLoginPage)
+	s.mux.HandleFunc("/api/login", s.handleLogin)
 	s.mux.HandleFunc("/assets/logo.png", s.handleLogo)
 
 	// API 路由
@@ -217,4 +224,23 @@ func (s *Server) reloadCfg() error {
 // logFilePath 返回日志文件路径
 func logFilePath() string {
 	return filepath.Join(config.LogDir(), "cftunnelX.log")
+}
+
+func newAuthKey() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func ensureBootLog(version, port string) {
+	logPath := logFilePath()
+	_ = os.MkdirAll(filepath.Dir(logPath), 0700)
+	if info, err := os.Stat(logPath); err == nil && info.Size() > 0 {
+		return
+	}
+	logLine("cftunnelX %s Web 服务启动: port=%s", version, port)
+	logLine("配置目录: %s", config.Dir())
+	logLine("日志目录: %s", config.LogDir())
 }
