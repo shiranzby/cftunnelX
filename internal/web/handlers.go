@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shiranzby/cftunnelX/internal/authproxy"
 	"github.com/shiranzby/cftunnelX/internal/cfapi"
@@ -27,6 +28,7 @@ import (
 	"github.com/shiranzby/cftunnelX/internal/service"
 	"github.com/shiranzby/cftunnelX/internal/sshutil"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // netDialTimeout 包装 net.DialTimeout
@@ -1859,6 +1861,7 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 		}
 		writeOK(w, map[string]interface{}{
 			"username":       cfg.WebUI.Username,
+			"password":       cfg.WebUI.Password,
 			"has_password":   cfg.WebUI.Password != "",
 			"has_username":   cfg.WebUI.Username != "",
 			"port":           cfg.WebUI.Port,
@@ -2407,7 +2410,7 @@ func (s *Server) handleTerminalExec(w http.ResponseWriter, r *http.Request) {
 	execCmd := exec.CommandContext(ctx, exe, args...)
 	configureHiddenCommand(execCmd)
 	out, err := execCmd.CombinedOutput()
-	output := string(out)
+	output := terminalOutputString(out)
 	if err != nil {
 		output += fmt.Sprintf("\n[退出错误: %v]", err)
 	}
@@ -2415,6 +2418,18 @@ func (s *Server) handleTerminalExec(w http.ResponseWriter, r *http.Request) {
 		"output": output,
 		"cmd":    cmd,
 	})
+}
+
+func terminalOutputString(out []byte) string {
+	if utf8.Valid(out) {
+		return string(out)
+	}
+	if runtime.GOOS == "windows" {
+		if s, err := simplifiedchinese.GBK.NewDecoder().String(string(out)); err == nil {
+			return s
+		}
+	}
+	return string(out)
 }
 
 // selfExePath 返回当前可执行文件路径
