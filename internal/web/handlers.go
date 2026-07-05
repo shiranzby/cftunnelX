@@ -433,7 +433,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg = cfg
-		logLine("隧道创建成功: %s (ID: %s)", tunnel.Name, tunnel.ID)
+		logLine("Web ??????????: %s (%s)", tunnel.Name, tunnel.ID)
 		writeOK(w, map[string]interface{}{
 			"id":   tunnel.ID,
 			"name": tunnel.Name,
@@ -1878,6 +1878,7 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 			RemoteDomain  string  `json:"remote_domain"`
 			TunnelName    string  `json:"tunnel_name"`
 			ServiceName   string  `json:"service_name"`
+			Port          string  `json:"port"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, 400, "请求格式错误")
@@ -1899,6 +1900,14 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 		if body.Theme != "" {
 			cfg.WebUI.Theme = body.Theme
 		}
+		if body.Port != "" {
+			port := strings.TrimSpace(body.Port)
+			if _, err := strconv.Atoi(port); err != nil {
+				writeError(w, 400, "端口必须是数字")
+				return
+			}
+			cfg.WebUI.Port = port
+		}
 		cfg.WebUI.RemoteEnabled = body.RemoteEnabled
 		cfg.WebUI.RemoteDomain = strings.TrimSpace(body.RemoteDomain)
 		if body.TunnelName != "" {
@@ -1908,6 +1917,13 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 			cfg.WebUI.ServiceName = body.ServiceName
 		} else if cfg.WebUI.ServiceName == "" {
 			cfg.WebUI.ServiceName = "cftunnelX-web"
+		}
+
+		if cfg.WebUI.RemoteEnabled {
+			if err := ensureWebRemote(cfg); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
 		}
 
 		if err := cfg.Save(); err != nil {
@@ -1960,6 +1976,137 @@ func (s *Server) handleZones(w http.ResponseWriter, r *http.Request) {
 }
 
 // ========== 主题 ==========
+
+func (s *Server) handleWebRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	port := strings.TrimSpace(cfg.WebUI.Port)
+	if port == "" {
+		port = s.listenPort()
+	}
+	if port == "" {
+		port = "7860"
+	}
+	exe := selfExePath()
+	cmd := exec.Command(exe, "web", "--open=false", "--port", port)
+	configureHiddenCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	logLine("\u0057\u0065\u0062 \u670d\u52a1\u91cd\u542f\u8bf7\u6c42: port=%s", port)
+	writeOK(w, map[string]string{"url": "http://127.0.0.1:" + port, "port": port})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+	}()
+}
+
+func ensureWebRemote(cfg *config.Config) error {
+	if cfg.Auth.APIToken == "" || cfg.Auth.AccountID == "" {
+		return fmt.Errorf("\u8bf7\u5148\u914d\u7f6e Cloudflare API Token \u548c Account ID")
+	}
+	domain := strings.TrimSpace(cfg.WebUI.RemoteDomain)
+	if domain == "" {
+		return fmt.Errorf("\u8bf7\u586b\u5199 Web \u8fdc\u7a0b\u8bbf\u95ee\u57df\u540d")
+	}
+	tunnelName := strings.TrimSpace(cfg.WebUI.TunnelName)
+	if tunnelName == "" {
+		tunnelName = "cftunnelX-web"
+		cfg.WebUI.TunnelName = tunnelName
+	}
+	serviceName := strings.TrimSpace(cfg.WebUI.ServiceName)
+	if serviceName == "" {
+		serviceName = "cftunnelX-web"
+		cfg.WebUI.ServiceName = serviceName
+	}
+	port := strings.TrimSpace(cfg.WebUI.Port)
+	if port == "" {
+		port = "7860"
+		cfg.WebUI.Port = port
+	}
+
+	client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
+	ctx := context.Background()
+	var tunnel *config.TunnelConfig
+	for i := range cfg.Tunnels {
+		if cfg.Tunnels[i].Name == tunnelName {
+			tunnel = &cfg.Tunnels[i]
+			break
+		}
+	}
+	if tunnel == nil {
+		cfTunnel, err := client.CreateTunnel(ctx, tunnelName)
+		if err != nil {
+			return err
+		}
+		token, err := client.GetTunnelToken(ctx, cfTunnel.ID)
+		if err != nil {
+			return err
+		}
+		cfg.Tunnels = append(cfg.Tunnels, config.TunnelConfig{ID: cfTunnel.ID, Name: cfTunnel.Name, Token: token})
+		tunnel = &cfg.Tunnels[len(cfg.Tunnels)-1]
+		logLine("\u0057\u0065\u0062 \u8fdc\u7a0b\u8bbf\u95ee\u81ea\u52a8\u521b\u5efa\u96a7\u9053: %s (%s)", tunnel.Name, tunnel.ID)
+	}
+
+	zone, err := findZoneForDomain(client, ctx, domain)
+	if err != nil {
+		return err
+	}
+	target := tunnel.ID + ".cfargotunnel.com"
+	recordID, err := client.FindDNSRecord(ctx, zone.ID, domain)
+	if err != nil {
+		return err
+	}
+	if recordID != "" {
+		if err := client.UpdateCNAME(ctx, zone.ID, recordID, domain, target); err != nil {
+			return err
+		}
+	} else {
+		recordID, err = client.CreateCNAME(ctx, zone.ID, domain, target)
+		if err != nil {
+			return err
+		}
+	}
+
+	service := "http://localhost:" + port
+	found := false
+	for i := range tunnel.Routes {
+		if tunnel.Routes[i].Name == serviceName {
+			tunnel.Routes[i].Hostname = domain
+			tunnel.Routes[i].Service = service
+			tunnel.Routes[i].ZoneID = zone.ID
+			tunnel.Routes[i].DNSRecordID = recordID
+			found = true
+			break
+		}
+	}
+	if !found {
+		tunnel.Routes = append(tunnel.Routes, config.RouteConfig{Name: serviceName, Hostname: domain, Service: service, ZoneID: zone.ID, DNSRecordID: recordID})
+	}
+
+	rules := make([]cfapi.IngressRule, 0, len(tunnel.Routes))
+	for _, route := range tunnel.Routes {
+		rules = append(rules, cfapi.IngressRule{Hostname: route.Hostname, Service: route.Service})
+	}
+	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
+		return err
+	}
+	if !daemon.RunningTunnel(tunnel.ID) {
+		if err := daemon.StartTunnel(tunnel.ID, tunnel.Token); err != nil {
+			return err
+		}
+	}
+	logLine("\u0057\u0065\u0062 \u8fdc\u7a0b\u8bbf\u95ee\u5df2\u540c\u6b65: %s -> %s", domain, service)
+	return nil
+}
 
 func (s *Server) handleTheme(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

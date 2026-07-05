@@ -9,15 +9,14 @@ import (
 	"strings"
 )
 
-const appStartupTaskName = "cftunnel-webui"
+const appStartupTaskName = "cftunnelX-webui"
 
 func appStartupStatus() map[string]interface{} {
 	out, err := hiddenCommand("schtasks", "/Query", "/TN", appStartupTaskName, "/FO", "LIST").Output()
 	if err != nil {
-		return map[string]interface{}{"installed": false, "running": false}
+		return map[string]interface{}{"installed": false, "running": appProcessRunning()}
 	}
-	running := strings.Contains(string(out), "Status: Running") || strings.Contains(string(out), "状态: 正在运行")
-	return map[string]interface{}{"installed": true, "running": running}
+	return map[string]interface{}{"installed": true, "running": appProcessRunning(), "raw": string(out)}
 }
 
 func appStartupInstall() error {
@@ -33,4 +32,15 @@ func appStartupInstall() error {
 
 func appStartupUninstall() error {
 	return hiddenCommand("schtasks", "/Delete", "/TN", appStartupTaskName, "/F").Run()
+}
+
+func appProcessRunning() bool {
+	out, err := hiddenCommand("tasklist", "/FO", "CSV").Output()
+	if err != nil {
+		return false
+	}
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "cftunnelx.exe") ||
+		strings.Contains(s, "cftunnelx-cli.exe") ||
+		strings.Contains(s, "cftunnelx-desktop.exe")
 }

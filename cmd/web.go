@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/shiranzby/cftunnelX/internal/config"
+	"github.com/shiranzby/cftunnelX/internal/logutil"
 	"github.com/shiranzby/cftunnelX/internal/web"
 	"github.com/spf13/cobra"
 )
@@ -52,6 +54,11 @@ var webCmd = &cobra.Command{
 			cfg.WebUI.Port = port
 			cfg.Save()
 		}
+
+		logPath := filepath.Join(config.LogDir(), "cftunnelX.log")
+		logutil.Write(logPath, "INFO", "cftunnelX %s Web 服务启动: port=%s", Version, port)
+		logutil.Write(logPath, "INFO", "配置目录: %s", config.Dir())
+		logutil.Write(logPath, "INFO", "日志目录: %s", config.LogDir())
 
 		server := web.NewServer(cfg, port, Version)
 

@@ -47,6 +47,13 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 	}
 
 	s.registerRoutes()
+	logLine("WebUI ???: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
+	ips := localIPs()
+	if len(ips) == 0 {
+		logLine("????: ???????? IP")
+	} else {
+		logLine("????: ?? IP %s", strings.Join(ips, ", "))
+	}
 
 	s.srv = &http.Server{
 		Addr:    ":" + port,
@@ -89,6 +96,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/relay/server/setup", s.handleRelayServerSetup)
 	s.mux.HandleFunc("/api/diagnose", s.handleDiagnose)
 	s.mux.HandleFunc("/api/webpanel", s.handleWebPanel)
+	s.mux.HandleFunc("/api/web/restart", s.handleWebRestart)
 	s.mux.HandleFunc("/api/zones", s.handleZones)
 	s.mux.HandleFunc("/api/theme", s.handleTheme)
 	s.mux.HandleFunc("/api/version", s.handleVersion)
