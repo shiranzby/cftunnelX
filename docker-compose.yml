@@ -1,7 +1,7 @@
 services:
   cftunnelx:
     build: .
-    image: cftunnelx:v4.9
+    image: cftunnelx:v4.91
     container_name: cftunnelx
     restart: unless-stopped
     ports:
