@@ -433,7 +433,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg = cfg
-		logLine("Web ??????????: %s (%s)", tunnel.Name, tunnel.ID)
+		logLine("Web 创建隧道: %s (%s)", tunnel.Name, tunnel.ID)
 		writeOK(w, map[string]interface{}{
 			"id":   tunnel.ID,
 			"name": tunnel.Name,
@@ -2160,6 +2160,13 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 405, "method not allowed")
 		return
 	}
+	if _, err := os.Stat(logPath); os.IsNotExist(err) {
+		ensureBootLog(s.version, s.listenPort())
+	} else if err == nil {
+		if info, statErr := os.Stat(logPath); statErr == nil && info.Size() == 0 {
+			ensureBootLog(s.version, s.listenPort())
+		}
+	}
 
 	limit := 200
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -2170,11 +2177,24 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	lines, err := readLogTailLines(logPath, limit)
 	if err != nil {
+		ensureBootLog(s.version, s.listenPort())
+		lines, err = readLogTailLines(logPath, limit)
+		if err == nil {
+			writeOK(w, map[string]interface{}{
+				"lines": lines,
+				"path":  logPath,
+			})
+			return
+		}
 		writeOK(w, map[string]interface{}{
 			"lines": []string{},
 			"path":  logPath,
 		})
 		return
+	}
+	if len(lines) == 0 {
+		ensureBootLog(s.version, s.listenPort())
+		lines, _ = readLogTailLines(logPath, limit)
 	}
 	writeOK(w, map[string]interface{}{
 		"lines": lines,

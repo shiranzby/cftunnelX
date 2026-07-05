@@ -21,6 +21,9 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
+//go:embed static/logo.png
+var logoPNG []byte
+
 type Server struct {
 	cfg     *config.Config
 	mux     *http.ServeMux
@@ -47,12 +50,13 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 	}
 
 	s.registerRoutes()
-	logLine("WebUI ???: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
+	ensureBootLog(version, port)
+	logLine("WebUI 初始化: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
 	ips := localIPs()
 	if len(ips) == 0 {
-		logLine("????: ???????? IP")
+		logLine("网络状态: 未检测到可用本机 IP")
 	} else {
-		logLine("????: ?? IP %s", strings.Join(ips, ", "))
+		logLine("网络状态: 本机 IP %s", strings.Join(ips, ", "))
 	}
 
 	s.srv = &http.Server{
@@ -66,6 +70,7 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 func (s *Server) registerRoutes() {
 	// SPA 主页
 	s.mux.HandleFunc("/", s.handleIndex)
+	s.mux.HandleFunc("/assets/logo.png", s.handleLogo)
 
 	// API 路由
 	s.mux.HandleFunc("/api/config", s.handleConfig)
@@ -167,6 +172,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(indexHTML)
 }
 
+func (s *Server) handleLogo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(logoPNG)
+}
+
 func (s *Server) listenPort() string {
 	if s == nil || s.srv == nil {
 		return ""
@@ -207,4 +218,12 @@ func (s *Server) reloadCfg() error {
 // logFilePath 返回日志文件路径
 func logFilePath() string {
 	return filepath.Join(config.LogDir(), "cftunnelX.log")
+}
+
+func ensureBootLog(version, port string) {
+	logPath := logFilePath()
+	_ = os.MkdirAll(filepath.Dir(logPath), 0700)
+	logLine("cftunnelX %s Web 服务启动: port=%s", version, port)
+	logLine("配置目录: %s", config.Dir())
+	logLine("日志目录: %s", config.LogDir())
 }

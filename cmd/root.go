@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var Version = "v4.4"
+var Version = "v4.7"
 
 var rootCmd = &cobra.Command{
 	Use:     "cftunnelX",
@@ -63,8 +63,6 @@ func startWebUI(port string, openBrowser bool) {
 	}
 
 	writeLog("cftunnelX %s 启动中... (GUI模式: %v)", Version, isWindowsGUI)
-	writeLog("配置目录: %s", config.Dir())
-	writeLog("日志目录: %s", config.LogDir())
 
 	server := web.NewServer(cfg, port, Version)
 	if openBrowser {
