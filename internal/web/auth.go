@@ -67,7 +67,7 @@ func isNoAuthPath(path string) bool {
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg, err := config.Load()
-		if err != nil || !cfg.WebUI.RemoteEnabled || cfg.WebUI.Username == "" || cfg.WebUI.Password == "" {
+		if !authRequired(cfg, err) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -84,12 +84,21 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
-	if isLocalRequest(r) || s.validSession(r) {
+	cfg, err := config.Load()
+	if !authRequired(cfg, err) || isLocalRequest(r) || s.validSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = loginTemplate.Execute(w, map[string]string{"Version": s.version})
+}
+
+func authRequired(cfg *config.Config, err error) bool {
+	return err == nil &&
+		cfg != nil &&
+		cfg.WebUI.RemoteEnabled &&
+		strings.TrimSpace(cfg.WebUI.Username) != "" &&
+		strings.TrimSpace(cfg.WebUI.Password) != ""
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {

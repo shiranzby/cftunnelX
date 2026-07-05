@@ -2182,6 +2182,10 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if len(lines) == 0 {
+		ensureBootLog(s.version, s.listenPort())
+		lines, _ = readLogTailLines(logPath, limit)
+	}
 	writeOK(w, map[string]interface{}{
 		"lines": lines,
 		"path":  logPath,

@@ -237,9 +237,6 @@ func newAuthKey() string {
 func ensureBootLog(version, port string) {
 	logPath := logFilePath()
 	_ = os.MkdirAll(filepath.Dir(logPath), 0700)
-	if info, err := os.Stat(logPath); err == nil && info.Size() > 0 {
-		return
-	}
 	logLine("cftunnelX %s Web 服务启动: port=%s", version, port)
 	logLine("配置目录: %s", config.Dir())
 	logLine("日志目录: %s", config.LogDir())
