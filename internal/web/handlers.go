@@ -1890,6 +1890,10 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error())
 			return
 		}
+		wasRemoteEnabled := cfg.WebUI.RemoteEnabled
+		oldTunnelName := strings.TrimSpace(cfg.WebUI.TunnelName)
+		oldServiceName := strings.TrimSpace(cfg.WebUI.ServiceName)
+		oldRemoteDomain := strings.TrimSpace(cfg.WebUI.RemoteDomain)
 		// 指针判断：明确传值(含空字符串)才更新，支持留空关闭认证
 		if body.Username != nil {
 			cfg.WebUI.Username = *body.Username
@@ -1921,6 +1925,11 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 
 		if cfg.WebUI.RemoteEnabled {
 			if err := ensureWebRemote(cfg); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+		} else if wasRemoteEnabled {
+			if err := disableWebRemote(cfg, oldTunnelName, oldServiceName, oldRemoteDomain); err != nil {
 				writeError(w, 500, err.Error())
 				return
 			}
@@ -2105,6 +2114,74 @@ func ensureWebRemote(cfg *config.Config) error {
 		}
 	}
 	logLine("\u0057\u0065\u0062 \u8fdc\u7a0b\u8bbf\u95ee\u5df2\u540c\u6b65: %s -> %s", domain, service)
+	return nil
+}
+
+func disableWebRemote(cfg *config.Config, tunnelName, serviceName, domain string) error {
+	if tunnelName == "" {
+		tunnelName = "cftunnelX-web"
+	}
+	if serviceName == "" {
+		serviceName = "cftunnelX-web"
+	}
+	domain = strings.TrimSpace(domain)
+
+	tunnelIndex := -1
+	for i := range cfg.Tunnels {
+		if cfg.Tunnels[i].Name == tunnelName {
+			tunnelIndex = i
+			break
+		}
+	}
+	if tunnelIndex < 0 {
+		return nil
+	}
+	tunnel := &cfg.Tunnels[tunnelIndex]
+	routeIndex := -1
+	for i := range tunnel.Routes {
+		r := tunnel.Routes[i]
+		if r.Name == serviceName || (domain != "" && r.Hostname == domain) {
+			routeIndex = i
+			break
+		}
+	}
+	if routeIndex < 0 {
+		return nil
+	}
+	if cfg.Auth.APIToken == "" || cfg.Auth.AccountID == "" {
+		return fmt.Errorf("关闭 Web 远程访问需要 Cloudflare API Token 和 Account ID 以删除远端路由")
+	}
+
+	route := tunnel.Routes[routeIndex]
+	wasRunning := daemon.RunningTunnel(tunnel.ID)
+	if wasRunning {
+		if err := daemon.StopTunnel(tunnel.ID); err != nil {
+			return err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
+	ctx := context.Background()
+	if route.DNSRecordID != "" && route.ZoneID != "" {
+		if err := client.DeleteDNSRecord(ctx, route.ZoneID, route.DNSRecordID); err != nil && !cfapi.IsDNSRecordNotFound(err) {
+			return err
+		}
+	}
+	tunnel.Routes = append(tunnel.Routes[:routeIndex], tunnel.Routes[routeIndex+1:]...)
+	rules := make([]cfapi.IngressRule, 0, len(tunnel.Routes))
+	for _, r := range tunnel.Routes {
+		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+	}
+	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
+		return err
+	}
+	if wasRunning {
+		if err := daemon.StartTunnel(tunnel.ID, tunnel.Token); err != nil {
+			return err
+		}
+	}
+	logLine("Web 远程访问已关闭并删除路由: %s (%s)", route.Name, route.Hostname)
 	return nil
 }
 

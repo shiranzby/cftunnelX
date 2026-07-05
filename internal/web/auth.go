@@ -2,6 +2,7 @@ package web
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -44,15 +45,13 @@ func clientHost(r *http.Request) string {
 	return host
 }
 
-// noAuthPaths 不需要认证的 API 路径（即使远程访问也不拦截）
-// 这些是"引导性"端点：配置认证、查看版本、设置主题等
+// noAuthPaths 不需要认证的资源/探测路径。配置类接口在远程认证开启后必须受保护。
 var noAuthPaths = map[string]bool{
-	"/api/webpanel": true,
-	"/api/config":   true,
-	"/api/theme":    true,
-	"/api/version":  true,
-	"/api/language": true,
-	"/api/port":     true,
+	"/api/theme":       true,
+	"/api/version":     true,
+	"/api/language":    true,
+	"/api/port":        true,
+	"/assets/logo.png": true,
 }
 
 // isNoAuthPath 检查路径是否在免认证白名单中
@@ -83,8 +82,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// 静态资源放行
-		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/static/") {
+		// 静态资源放行。远程访问开启认证时，页面入口仍需要认证，资源不重复弹框。
+		if strings.HasPrefix(r.URL.Path, "/static/") || strings.HasPrefix(r.URL.Path, "/assets/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -97,6 +96,12 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if !ok ||
 			subtle.ConstantTimeCompare([]byte(user), []byte(cfg.WebUI.Username)) != 1 ||
 			subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.WebUI.Password)) != 1 {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "认证失败"})
+				return
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="cftunnel"`)
 			http.Error(w, "认证失败", 401)
 			return
