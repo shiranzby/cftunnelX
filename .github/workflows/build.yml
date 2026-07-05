@@ -2,7 +2,6 @@ name: Build
 
 on:
   push:
-    branches: [main, master]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -61,6 +60,11 @@ jobs:
         with:
           name: cftunnelX-cli-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
+      - name: Upload CLI to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
 
   windows-gui:
     name: Windows browser GUI
@@ -81,6 +85,95 @@ jobs:
         with:
           name: cftunnelX-windows-browser-gui
           path: dist/*
+      - name: Upload Windows GUI to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  windows-portable:
+    name: Windows portable
+    runs-on: windows-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop-client/frontend/package-lock.json
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Install frontend dependencies
+        working-directory: desktop-client/frontend
+        run: npm ci
+      - name: Cache cloudflared
+        id: cache-cloudflared
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\cloudflared\cloudflared.exe
+          key: cloudflared-windows-amd64-2026.6.1
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:GITHUB_REF_NAME
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -buildvcs=false -ldflags "-s -w -H=windowsgui -X github.com/shiranzby/cftunnelX/cmd.Version=$version" -o "dist/cftunnelX-$version.exe" .
+          go build -buildvcs=false -ldflags "-s -w -X github.com/shiranzby/cftunnelX/cmd.Version=$version" -o "dist/cftunnelX-$version-cli.exe" .
+          Push-Location desktop-client
+          wails build -clean
+          Pop-Location
+
+          $cloudflaredVersion = "2026.6.1"
+          $cloudflaredZip = "cloudflared-windows-amd64.exe"
+          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/download/$cloudflaredVersion/$cloudflaredZip"
+          $cacheDir = Join-Path $env:RUNNER_TEMP "cloudflared"
+          New-Item -ItemType Directory -Force $cacheDir | Out-Null
+          $cloudflaredPath = Join-Path $cacheDir "cloudflared.exe"
+          if (-not (Test-Path $cloudflaredPath)) {
+            Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
+          }
+          $versionText = & $cloudflaredPath version
+          if ($versionText -notmatch $cloudflaredVersion) {
+            throw "cloudflared version check failed: $versionText"
+          }
+
+          $portableRoot = Join-Path (Resolve-Path dist) "cftunnelX-$version-windows-portable"
+          Remove-Item -Recurse -Force $portableRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $portableRoot | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $portableRoot "config\bin") | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $portableRoot "log") | Out-Null
+          Copy-Item "dist\cftunnelX-$version.exe" (Join-Path $portableRoot "cftunnelX.exe")
+          Copy-Item "dist\cftunnelX-$version-cli.exe" (Join-Path $portableRoot "cftunnelX-cli.exe")
+          Copy-Item "desktop-client\build\bin\cftunnelX-desktop.exe" (Join-Path $portableRoot "cftunnelX-desktop.exe")
+          Copy-Item $cloudflaredPath (Join-Path $portableRoot "config\bin\cloudflared.exe")
+          Copy-Item README.md (Join-Path $portableRoot "README.md")
+          Copy-Item LICENSE (Join-Path $portableRoot "LICENSE") -ErrorAction SilentlyContinue
+          if (Test-Path "internal\web\static\logo.png") { Copy-Item "internal\web\static\logo.png" (Join-Path $portableRoot "logo.png") }
+          @"
+          cftunnelX Windows Portable
+
+          - cftunnelX.exe: 浏览器 GUI 双击版
+          - cftunnelX-desktop.exe: Wails 桌面客户端
+          - cftunnelX-cli.exe: CLI 版本
+          - config/: 本目录下的配置文件
+          - config/bin/cloudflared.exe: 内置 cloudflared $cloudflaredVersion
+          - log/: 本目录下的日志文件
+          "@ | Set-Content -Path (Join-Path $portableRoot "PORTABLE-README.txt") -Encoding UTF8
+          Compress-Archive -Path $portableRoot -DestinationPath "dist\cftunnelX-$version-windows-portable.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cftunnelX-windows-portable
+          path: dist/*windows-portable.zip
+      - name: Upload portable to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*windows-portable.zip
 
   wails:
     name: Wails ${{ matrix.os }}
@@ -126,6 +219,11 @@ jobs:
         with:
           name: cftunnelX-wails-${{ matrix.os }}
           path: ${{ matrix.artifact }}
+      - name: Upload Wails desktop to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
 
   docker:
     name: Docker multi-arch
@@ -211,21 +309,8 @@ jobs:
         with:
           name: cftunnelX-openwrt-${{ matrix.pkgarch }}
           path: dist/*.ipk
-
-  release:
-    name: Release artifacts
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [cli, windows-gui, wails, docker, openwrt-ipk]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
+      - name: Upload OpenWrt IPK to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
-          path: artifacts
-      - name: Pack artifacts
-        run: |
-          find artifacts -maxdepth 3 -type f -print
-          cd artifacts
-          for d in *; do zip -r "../${d}.zip" "$d"; done
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: "*.zip"
+          files: dist/*.ipk
