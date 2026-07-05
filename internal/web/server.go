@@ -21,6 +21,9 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
+//go:embed static/logo.png
+var logoPNG []byte
+
 type Server struct {
 	cfg     *config.Config
 	mux     *http.ServeMux
@@ -47,12 +50,12 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 	}
 
 	s.registerRoutes()
-	logLine("WebUI ???: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
+	logLine("WebUI \u521d\u59cb\u5316: version=%s port=%s config=%s log=%s", version, port, config.Dir(), config.LogDir())
 	ips := localIPs()
 	if len(ips) == 0 {
-		logLine("????: ???????? IP")
+		logLine("\u7f51\u7edc\u72b6\u6001: \u672a\u68c0\u6d4b\u5230\u53ef\u7528\u672c\u673a IP")
 	} else {
-		logLine("????: ?? IP %s", strings.Join(ips, ", "))
+		logLine("\u7f51\u7edc\u72b6\u6001: \u672c\u673a IP %s", strings.Join(ips, ", "))
 	}
 
 	s.srv = &http.Server{
@@ -66,6 +69,7 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 func (s *Server) registerRoutes() {
 	// SPA 主页
 	s.mux.HandleFunc("/", s.handleIndex)
+	s.mux.HandleFunc("/assets/logo.png", s.handleLogo)
 
 	// API 路由
 	s.mux.HandleFunc("/api/config", s.handleConfig)
@@ -165,6 +169,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(indexHTML)
+}
+
+func (s *Server) handleLogo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(logoPNG)
 }
 
 func (s *Server) listenPort() string {

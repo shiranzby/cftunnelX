@@ -433,7 +433,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg = cfg
-		logLine("Web ??????????: %s (%s)", tunnel.Name, tunnel.ID)
+		logLine("Web \u521b\u5efa\u96a7\u9053: %s (%s)", tunnel.Name, tunnel.ID)
 		writeOK(w, map[string]interface{}{
 			"id":   tunnel.ID,
 			"name": tunnel.Name,
