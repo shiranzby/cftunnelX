@@ -13,7 +13,7 @@ import (
 
 // pidFilePath 返回 frpc PID 文件路径
 func pidFilePath() string {
-	return filepath.Join(config.Dir(), "frpc.pid")
+	return filepath.Join(config.RunDir(), "frpc.pid")
 }
 
 // LogFilePath 返回中继模式日志路径
@@ -55,6 +55,11 @@ func Start() error {
 		logFile.Close()
 		return fmt.Errorf("启动 frpc 失败: %w", err)
 	}
+	// 后台回收子进程，避免僵尸进程；同时关闭日志句柄，避免反复启停时泄漏 fd
+	go func() {
+		_ = cmd.Wait()
+		_ = logFile.Close()
+	}()
 	os.WriteFile(pidFilePath(), []byte(strconv.Itoa(cmd.Process.Pid)), 0600)
 	fmt.Printf("frpc 已启动 (PID: %d)\n", cmd.Process.Pid)
 	return nil
