@@ -25,6 +25,9 @@ func main() {
 		OnStartup: func(ctx context.Context) {
 			app.startup(ctx)
 		},
+		OnShutdown: func(ctx context.Context) {
+			app.shutdown(ctx)
+		},
 	})
 	if err != nil {
 		println("Error:", err.Error())
