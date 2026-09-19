@@ -35,7 +35,7 @@ type Config struct {
 	Username   string
 	Password   string
 	TargetPort string
-	SigningKey  []byte
+	SigningKey []byte
 	CookieTTL  time.Duration
 }
 
@@ -47,14 +47,37 @@ type Proxy struct {
 	reverse  *httputil.ReverseProxy
 }
 
-// New 创建鉴权代理实例，自动探测可用端口
+// New 创建鉴权代理实例，自动探测可用端口（从 target+1 起）。
+//
+// 注意：仅适用于"代理生命周期与当前进程一致"的场景（如免域名模式）。
+// 需要把端口写进远端 ingress 时，必须用 NewOnPort 精确绑定——见其说明。
 func New(cfg Config) (*Proxy, error) {
 	port, _ := strconv.Atoi(cfg.TargetPort)
 	ln, err := FindAvailableListener(port + 1)
 	if err != nil {
 		return nil, err
 	}
+	return build(cfg, ln), nil
+}
 
+// NewOnPort 在指定端口创建鉴权代理；端口被占用时返回错误。
+//
+// 🔴 需要远端 ingress 指向该代理时必须用这个函数。
+// 因为 ingress 里写的是固定端口号，一旦代理实际监听端口与它不一致，
+// 轻则 502，重则 ingress 仍指向源站而认证被完全绕过。
+// 因此这里精确绑定、冲突即报错，而不是"就近找一个可用端口"。
+func NewOnPort(cfg Config, port int) (*Proxy, error) {
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("鉴权代理端口无效: %d", port)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		return nil, fmt.Errorf("鉴权代理端口 %d 无法监听: %w", port, err)
+	}
+	return build(cfg, ln), nil
+}
+
+func build(cfg Config, ln net.Listener) *Proxy {
 	target, _ := url.Parse("http://127.0.0.1:" + cfg.TargetPort)
 	rp := httputil.NewSingleHostReverseProxy(target)
 
@@ -68,7 +91,7 @@ func New(cfg Config) (*Proxy, error) {
 		reverse:  rp,
 	}
 	p.server = &http.Server{Handler: p}
-	return p, nil
+	return p
 }
 
 // ListenPort 返回代理实际监听的端口

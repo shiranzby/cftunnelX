@@ -11,12 +11,14 @@ import (
 
 type Client struct {
 	api       *cf.Client
+	apiToken  string
 	accountID string
 }
 
 func New(apiToken, accountID string) *Client {
 	return &Client{
 		api:       cf.NewClient(option.WithAPIToken(apiToken)),
+		apiToken:  apiToken,
 		accountID: accountID,
 	}
 }
