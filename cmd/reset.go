@@ -33,7 +33,7 @@ var resetCmd = &cobra.Command{
 		}
 
 		cfg, _ := config.Load()
-		if cfg != nil && cfg.Tunnel.ID != "" {
+		if cfg != nil && cfg.ActiveTunnel() != nil {
 			destroyForce = true
 			if err := destroyCmd.RunE(cmd, nil); err != nil {
 				fmt.Printf("警告: 删除隧道失败: %v\n", err)

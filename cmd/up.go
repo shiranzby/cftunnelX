@@ -2,21 +2,24 @@ package cmd
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
-	"strconv"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/shiranzby/cftunnelX/internal/authproxy"
-	"github.com/shiranzby/cftunnelX/internal/cfapi"
 	"github.com/shiranzby/cftunnelX/internal/config"
 	"github.com/shiranzby/cftunnelX/internal/daemon"
+	"github.com/shiranzby/cftunnelX/internal/ingress"
 	"github.com/shiranzby/cftunnelX/internal/selfupdate"
 	"github.com/spf13/cobra"
 )
 
+var allowAuthBypass bool
+
 func init() {
+	upCmd.Flags().BoolVar(&allowAuthBypass, "allow-auth-bypass", false,
+		"排障用：鉴权代理不可用时仍强制启动（认证将不生效，请勿长期使用）")
 	rootCmd.AddCommand(upCmd)
 }
 
@@ -28,55 +31,48 @@ var upCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if cfg.Tunnel.Token == "" {
-			return fmt.Errorf("请先运行 cftunnel init && cftunnel create <名称>")
+		tunnel := cfg.ActiveTunnel()
+		if tunnel == nil || tunnel.Token == "" {
+			return fmt.Errorf("请先运行 cftunnelX init && cftunnelX create <名称>")
 		}
 
-		// 为有鉴权配置的路由启动代理
-		var proxies []*authproxy.Proxy
-		for i, r := range cfg.Routes {
-			if r.Auth == nil {
-				continue
-			}
-			sigKey, err := hex.DecodeString(r.Auth.SigningKey)
-			if err != nil {
-				return fmt.Errorf("路由 %s 的 signing_key 无效: %w", r.Name, err)
-			}
-			// 从 service URL 提取端口
-			port := extractPort(r.Service)
-			if port == "" {
-				return fmt.Errorf("路由 %s 的 service 格式无效: %s", r.Name, r.Service)
-			}
-			proxy, err := authproxy.New(authproxy.Config{
-				Username:   r.Auth.Username,
-				Password:   r.Auth.Password,
-				TargetPort: port,
-				SigningKey:  sigKey,
-				CookieTTL:  time.Duration(r.Auth.CookieTTLOrDefault()) * time.Second,
-			})
-			if err != nil {
-				return fmt.Errorf("路由 %s 启动鉴权代理失败: %w", r.Name, err)
-			}
-			if err := proxy.Start(); err != nil {
-				return fmt.Errorf("路由 %s 启动鉴权代理失败: %w", r.Name, err)
-			}
-			proxies = append(proxies, proxy)
-			proxyPort := strconv.Itoa(proxy.ListenPort())
-			fmt.Printf("鉴权代理已启动: %s → 127.0.0.1:%s → 127.0.0.1:%s\n", r.Hostname, proxyPort, port)
-			// 临时修改 service 指向代理端口（仅内存，不持久化）
-			cfg.Routes[i].Service = "http://localhost:" + proxyPort
+		// 鉴权代理由**独立常驻进程**持有。
+		//
+		// up 是「启动即退出」的命令：代理若运行在本进程内，命令一退出代理就消失，
+		// 而远端 ingress 仍指向它的端口 —— 用户只会看到 502 且不知道原因。
+		// 若为了避开这一点而让 ingress 指向源站，认证就被完全绕过了。
+		//
+		// 顺序不能反：先把代理解析起来，再推送 ingress，
+		// 否则会出现「ingress 已指向代理端口、代理却还没起」的窗口。
+		if _, err := daemon.StartAuthProxies(cfg); err != nil {
+			return fmt.Errorf("鉴权代理未就绪: %w", err)
 		}
-		// 确保退出时关闭所有代理
-		defer func() {
-			for _, p := range proxies {
-				p.Stop()
+		if gaps := ingress.CheckAuthProxies(cfg); len(gaps) > 0 {
+			if !allowAuthBypass {
+				lines := make([]string, 0, len(gaps))
+				for _, g := range gaps {
+					lines = append(lines, "    - "+g.String())
+				}
+				return fmt.Errorf(
+					"以下路由启用了鉴权，但鉴权代理未在监听：\n%s\n"+
+						"  为避免推送一份会绕过认证的 ingress，本次启动已中止。\n"+
+						"  可检查：\n"+
+						"    - 鉴权代理日志 %s\n"+
+						"    - 端口是否被其他程序占用（cftunnelX status 会显示路径信息）\n"+
+						"  确需临时跳过认证排障，可加 --allow-auth-bypass",
+					strings.Join(lines, "\n"),
+					filepath.Join(config.LogDir(), "cftunnelX-authproxy.log"))
 			}
-		}()
+			fmt.Fprintln(os.Stderr,
+				"警告: 已启用 --allow-auth-bypass，鉴权路由将直接指向源站，认证不会生效")
+		}
 
-		// 启动前同步 ingress 配置到远端，确保本地与远端一致
-		if len(cfg.Routes) > 0 {
-			client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
-			if err := pushIngress(client, context.Background(), cfg); err != nil {
+		// 启动前同步 ingress，确保本地与远端一致。
+		// 统一走 internal/ingress —— 这是全项目唯一生成 ingress 的地方，
+		// 会为鉴权路由自动换成代理端口。
+		if len(tunnel.Routes) > 0 {
+			opts := ingress.Options{BypassAuth: allowAuthBypass}
+			if err := ingress.PushWith(context.Background(), cfg, tunnel.ID, opts); err != nil {
 				fmt.Printf("警告: 同步 ingress 失败: %v（将使用远端现有配置）\n", err)
 			} else {
 				fmt.Println("ingress 配置已同步")
@@ -87,19 +83,23 @@ var upCmd = &cobra.Command{
 		if cfg.SelfUpdate.AutoCheck {
 			if latest, err := selfupdate.LatestVersion(); err == nil {
 				if latest != "v"+Version && latest != Version {
-					fmt.Printf("发现新版本: %s → %s (运行 cftunnel update 更新)\n", Version, latest)
+					fmt.Printf("发现新版本: %s → %s (运行 cftunnelX update 更新)\n", Version, latest)
 				}
 			}
 		}
-		return daemon.Start(cfg.Tunnel.Token)
-	},
-}
 
-// extractPort 从 "http://localhost:3000" 格式中提取端口号
-func extractPort(service string) string {
-	idx := strings.LastIndex(service, ":")
-	if idx < 0 {
-		return ""
-	}
-	return service[idx+1:]
+		if err := daemon.StartTunnel(tunnel.ID, tunnel.Token); err != nil {
+			return err
+		}
+		fmt.Printf("隧道已启动 (PID: %d)，正在确认进程稳定...\n", daemon.TunnelPID(tunnel.ID))
+
+		// 确认进程不会在数秒内退出。cloudflared 若因 token 无效、
+		// 出口 7844 被安全组拦截等原因启动失败，会很快消失；不做这个检查
+		// 用户只会看到"已启动"，而隧道实际不通。
+		if err := daemon.WaitTunnelStable(tunnel.ID, 6*time.Second); err != nil {
+			return err
+		}
+		fmt.Println("隧道已稳定运行")
+		return nil
+	},
 }

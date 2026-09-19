@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var Version = "v4.92"
+var Version = "v4.93.2"
 
 var rootCmd = &cobra.Command{
 	Use:     "cftunnelX",
@@ -19,10 +19,30 @@ var rootCmd = &cobra.Command{
 	Version: Version,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		checkWindowsVersion()
+		ensureConfigDirs()
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		startWebUI("7860", true)
 	},
+}
+
+// ensureConfigDirs 在命令执行前准备好配置 / 日志 / 依赖目录。
+//
+// Linux 与 OpenWrt 上数据目录可能位于 /etc、/var/log、/var/lib，
+// 需要 root 或预先创建；这里给出包含具体路径与解决方式的中文提示，
+// 而不是让后续操作抛出 permission denied。
+func ensureConfigDirs() {
+	if err := config.Ensure(); err != nil {
+		fmt.Fprintln(os.Stderr, "错误: "+err.Error())
+		os.Exit(1)
+	}
+	if from := config.DegradedFrom(); from != "" {
+		fmt.Fprintf(os.Stderr, "警告: %s 不可写，已改用用户目录 %s\n", from, config.Dir())
+		fmt.Fprintln(os.Stderr, "      如需系统级配置，请使用 sudo 运行，或设置 CFTUNNEL_HOME 指定目录")
+	}
+	if from := config.MigratedFrom(); from != "" {
+		fmt.Fprintf(os.Stderr, "提示: 已将旧配置 %s 迁移到 %s\n", from, config.Path())
+	}
 }
 
 func Execute() {

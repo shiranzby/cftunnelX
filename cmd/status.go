@@ -8,6 +8,7 @@ import (
 	"github.com/shiranzby/cftunnelX/internal/config"
 	"github.com/shiranzby/cftunnelX/internal/daemon"
 	"github.com/shiranzby/cftunnelX/internal/relay"
+	"github.com/shiranzby/cftunnelX/internal/service"
 	"github.com/spf13/cobra"
 )
 
@@ -20,8 +21,19 @@ func init() {
 
 // StatusOutput status 命令的结构化输出
 type StatusOutput struct {
+	Env   *EnvStatus   `json:"env,omitempty"`
 	Cloud *CloudStatus `json:"cloud,omitempty"`
 	Relay *RelayStatus `json:"relay,omitempty"`
+}
+
+// EnvStatus 运行环境信息（Linux/OpenWrt 排障时最需要的部分）
+type EnvStatus struct {
+	TargetVersion string `json:"target"`
+	PathMode      string `json:"path_mode"`
+	ConfigDir     string `json:"config_dir"`
+	LogDir        string `json:"log_dir"`
+	BinDir        string `json:"bin_dir"`
+	ServiceMode   string `json:"service_mode"`
 }
 
 // CloudStatus Cloud 模式状态
@@ -83,16 +95,25 @@ var statusCmd = &cobra.Command{
 func buildStatus(cfg *config.Config) StatusOutput {
 	var out StatusOutput
 
-	if cfg.Tunnel.ID != "" {
+	out.Env = &EnvStatus{
+		TargetVersion: Version,
+		PathMode:      config.Mode(),
+		ConfigDir:     config.Dir(),
+		LogDir:        config.LogDir(),
+		BinDir:        config.BinDir(),
+		ServiceMode:   service.ServiceMode(),
+	}
+
+	if t := cfg.ActiveTunnel(); t != nil {
 		cs := &CloudStatus{
-			TunnelName: cfg.Tunnel.Name,
-			TunnelID:   cfg.Tunnel.ID,
-			Running:    daemon.Running(),
+			TunnelName: t.Name,
+			TunnelID:   t.ID,
+			Running:    daemon.RunningTunnel(t.ID),
 		}
 		if cs.Running {
-			cs.PID = daemon.PID()
+			cs.PID = daemon.TunnelPID(t.ID)
 		}
-		for _, r := range cfg.Routes {
+		for _, r := range cfg.ActiveRoutes() {
 			cs.Routes = append(cs.Routes, RouteStatus{
 				Name:     r.Name,
 				Hostname: r.Hostname,
@@ -127,8 +148,23 @@ func buildStatus(cfg *config.Config) StatusOutput {
 }
 
 func printStatus(out StatusOutput) {
+	if out.Env != nil {
+		e := out.Env
+		fmt.Println("运行环境")
+		fmt.Printf("  版本:     %s\n", e.TargetVersion)
+		fmt.Printf("  路径模式: %s\n", e.PathMode)
+		fmt.Printf("  配置目录: %s\n", e.ConfigDir)
+		fmt.Printf("  日志目录: %s\n", e.LogDir)
+		fmt.Printf("  依赖目录: %s\n", e.BinDir)
+		fmt.Printf("  服务管理: %s\n", e.ServiceMode)
+		if from := config.DegradedFrom(); from != "" {
+			fmt.Printf("  注意:     %s 不可写，已降级到用户目录\n", from)
+		}
+		fmt.Println()
+	}
+
 	if out.Cloud == nil && out.Relay == nil {
-		fmt.Println("未配置任何模式，请运行 cftunnel init 或 cftunnel relay init")
+		fmt.Println("未配置任何模式，请运行 cftunnelX init 或 cftunnelX relay init")
 		return
 	}
 

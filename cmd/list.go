@@ -22,7 +22,7 @@ var listCmd = &cobra.Command{
 			return err
 		}
 
-		hasCloud := len(cfg.Routes) > 0
+		hasCloud := len(cfg.ActiveRoutes()) > 0
 		hasRelay := len(cfg.Relay.Rules) > 0
 
 		if !hasCloud && !hasRelay {
@@ -35,7 +35,7 @@ var listCmd = &cobra.Command{
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "名称\t域名\t服务\t鉴权")
 			fmt.Fprintln(w, "----\t----\t----\t----")
-			for _, r := range cfg.Routes {
+			for _, r := range cfg.ActiveRoutes() {
 				auth := "-"
 				if r.Auth != nil {
 					auth = "✓"

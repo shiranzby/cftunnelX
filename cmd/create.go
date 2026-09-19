@@ -23,10 +23,10 @@ var createCmd = &cobra.Command{
 			return err
 		}
 		if cfg.Auth.APIToken == "" {
-			return fmt.Errorf("请先运行 cftunnel init 配置认证信息")
+			return fmt.Errorf("请先运行 cftunnelX init 配置认证信息")
 		}
-		if cfg.Tunnel.ID != "" {
-			return fmt.Errorf("已存在隧道 %s (%s)，如需重建请先 cftunnel destroy", cfg.Tunnel.Name, cfg.Tunnel.ID)
+		if existing := cfg.ActiveTunnel(); existing != nil {
+			return fmt.Errorf("已存在隧道 %s (%s)，如需重建请先 cftunnelX destroy", existing.Name, existing.ID)
 		}
 
 		client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
@@ -44,11 +44,11 @@ var createCmd = &cobra.Command{
 			return err
 		}
 
-		cfg.Tunnel = config.TunnelConfig{ID: tunnel.ID, Name: tunnel.Name, Token: token}
+		cfg.Tunnels = append(cfg.Tunnels, config.TunnelConfig{ID: tunnel.ID, Name: tunnel.Name, Token: token})
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Println("\n下一步: cftunnel add <服务名> <端口> -domain <域名>")
+		fmt.Println("\n下一步: cftunnelX add <服务名> <端口> -domain <域名>")
 		return nil
 	},
 }

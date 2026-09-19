@@ -23,12 +23,17 @@ func init() {
 }
 
 // pushIngress 推送当前所有路由的 ingress 配置到远端
+// pushIngress 同步当前活动隧道的 ingress。
+//
+// 注意用的是 cfg.IngressRoutes() 而不是 ActiveRoutes()：
+// 前者会把启用鉴权的路由替换成鉴权代理地址，后者会直接暴露源站端口
+// ——那等于认证不生效，而且不会有任何报错。
 func pushIngress(client *cfapi.Client, ctx context.Context, cfg *config.Config) error {
 	var rules []cfapi.IngressRule
-	for _, r := range cfg.Routes {
+	for _, r := range cfg.IngressRoutes() {
 		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
 	}
-	return client.PushIngressConfig(ctx, cfg.Tunnel.ID, rules)
+	return client.PushIngressConfig(ctx, cfg.ActiveTunnelID(), rules)
 }
 
 // findZoneForDomain 通过遍历账户 Zone 列表匹配域名（支持多级 TLD）
@@ -57,8 +62,8 @@ var addCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if cfg.Tunnel.ID == "" {
-			return fmt.Errorf("请先运行 cftunnel init && cftunnel create <名称>")
+		if cfg.ActiveTunnel() == nil {
+			return fmt.Errorf("请先运行 cftunnelX init && cftunnelX create <名称>")
 		}
 		if cfg.FindRoute(name) != nil {
 			return fmt.Errorf("路由 %s 已存在", name)
@@ -74,7 +79,7 @@ var addCmd = &cobra.Command{
 		}
 
 		// 检查 DNS 记录是否已存在
-		target := cfg.Tunnel.ID + ".cfargotunnel.com"
+		target := cfg.ActiveTunnelID() + ".cfargotunnel.com"
 		existingRecordID, err := client.FindDNSRecord(ctx, zone.ID, addDomain)
 		if err != nil {
 			return err
@@ -121,7 +126,7 @@ var addCmd = &cobra.Command{
 		}
 
 		// 保存路由
-		cfg.Routes = append(cfg.Routes, route)
+		cfg.AddActiveRoute(route)
 		if err := cfg.Save(); err != nil {
 			return err
 		}

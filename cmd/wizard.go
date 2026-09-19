@@ -92,7 +92,7 @@ func runWizard(cmd *cobra.Command, args []string) error {
 	}
 
 	// ============ 第3步: 创建 Tunnel (如果不存在) ============
-	if cfg.Tunnel.ID == "" {
+	if cfg.ActiveTunnel() == nil {
 		fmt.Println("📋 第2步: 创建 Tunnel")
 		fmt.Println()
 
@@ -127,18 +127,18 @@ func runWizard(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("获取 Tunnel Token 失败: %w", err)
 		}
 
-		cfg.Tunnel = config.TunnelConfig{
+		cfg.Tunnels = append(cfg.Tunnels, config.TunnelConfig{
 			ID:    tunnel.ID,
 			Name:  tunnelName,
 			Token: tunnelToken,
-		}
+		})
 		if err := cfg.Save(); err != nil {
 			return err
 		}
 		fmt.Printf("✓ Tunnel 创建成功: %s\n", tunnelName)
 		fmt.Println()
 	} else {
-		fmt.Printf("✓ 已有 Tunnel: %s (%s)\n", cfg.Tunnel.Name, cfg.Tunnel.ID)
+		fmt.Printf("✓ 已有 Tunnel: %s (%s)\n", cfg.ActiveTunnelName(), cfg.ActiveTunnelID())
 		fmt.Println()
 	}
 
@@ -147,9 +147,9 @@ func runWizard(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
 	// 启动 tunnel（如果未运行）
-	if !daemon.Running() {
+	if active := cfg.ActiveTunnel(); active != nil && !daemon.RunningTunnel(active.ID) {
 		fmt.Println("📋 第3步: 启动 Tunnel")
-		go daemon.Start(cfg.Tunnel.Token)
+		go daemon.StartTunnel(active.ID, active.Token)
 		fmt.Println("✓ Tunnel 已启动")
 		fmt.Println()
 	}
@@ -213,7 +213,7 @@ func runWizard(cmd *cobra.Command, args []string) error {
 	}
 
 	// 创建 DNS CNAME 记录
-	target := cfg.Tunnel.ID + ".cfargotunnel.com"
+	target := cfg.ActiveTunnelID() + ".cfargotunnel.com"
 	fmt.Printf("正在创建 DNS 记录: %s -> %s\n", domain, target)
 	recordID, err := client.CreateCNAME(ctx, zone.ID, domain, target)
 	if err != nil {
@@ -244,7 +244,7 @@ func runWizard(cmd *cobra.Command, args []string) error {
 	}
 
 	// 保存路由
-	cfg.Routes = append(cfg.Routes, route)
+	cfg.AddActiveRoute(route)
 	if err := cfg.Save(); err != nil {
 		return err
 	}

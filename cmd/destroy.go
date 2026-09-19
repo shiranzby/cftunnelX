@@ -28,12 +28,14 @@ var destroyCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if cfg.Tunnel.ID == "" {
+		tunnel := cfg.ActiveTunnel()
+		if tunnel == nil {
 			return fmt.Errorf("未初始化，无隧道可删除")
 		}
+		tunnelID, tunnelName, routes := tunnel.ID, tunnel.Name, cfg.ActiveRoutes()
 
 		if !destroyForce {
-			fmt.Printf("即将删除隧道 %s (%s) 及其 %d 条路由，此操作不可恢复！\n", cfg.Tunnel.Name, cfg.Tunnel.ID, len(cfg.Routes))
+			fmt.Printf("即将删除隧道 %s (%s) 及其 %d 条路由，此操作不可恢复！\n", tunnelName, tunnelID, len(routes))
 			fmt.Print("确认删除？(y/N): ")
 			reader := bufio.NewReader(os.Stdin)
 			input, _ := reader.ReadString('\n')
@@ -44,16 +46,16 @@ var destroyCmd = &cobra.Command{
 		}
 
 		// 停止运行中的进程
-		if daemon.Running() {
+		if daemon.RunningTunnel(tunnelID) {
 			fmt.Println("正在停止隧道...")
-			daemon.Stop()
+			daemon.StopTunnel(tunnelID)
 		}
 
 		client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
 		ctx := context.Background()
 
 		// 删除所有 DNS 记录
-		for _, r := range cfg.Routes {
+		for _, r := range routes {
 			if r.DNSRecordID != "" && r.ZoneID != "" {
 				fmt.Printf("删除 DNS: %s\n", r.Hostname)
 				if err := client.DeleteDNSRecord(ctx, r.ZoneID, r.DNSRecordID); err != nil {
@@ -64,13 +66,12 @@ var destroyCmd = &cobra.Command{
 
 		// 删除隧道
 		fmt.Println("删除隧道...")
-		if err := client.DeleteTunnel(ctx, cfg.Tunnel.ID); err != nil {
+		if err := client.DeleteTunnel(ctx, tunnelID); err != nil {
 			fmt.Printf("警告: %v\n", err)
 		}
 
 		// 清空配置
-		cfg.Tunnel = config.TunnelConfig{}
-		cfg.Routes = nil
+		cfg.RemoveActiveTunnel()
 		if err := cfg.Save(); err != nil {
 			return err
 		}

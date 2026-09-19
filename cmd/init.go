@@ -64,7 +64,10 @@ var initCmd = &cobra.Command{
 			return fmt.Errorf("API 令牌和账户 ID 不能为空")
 		}
 
-		cfg, _ := config.Load()
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
 		cfg.Auth = config.AuthConfig{APIToken: apiToken, AccountID: accountID}
 		if err := cfg.Save(); err != nil {
 			return err

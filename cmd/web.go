@@ -10,10 +10,13 @@ import (
 
 var webPort string
 var webOpen bool
+var webHost string
 
 func init() {
 	webCmd.Flags().StringVar(&webPort, "port", "", "Web UI 端口 (默认 7860)")
-	webCmd.Flags().BoolVar(&webOpen, "open", true, "自动打开浏览器")
+	webCmd.Flags().StringVar(&webHost, "host", "",
+		"监听地址（默认自动：桌面环境 127.0.0.1，无图形界面的 Linux/OpenWrt 为 0.0.0.0）")
+	webCmd.Flags().BoolVar(&webOpen, "open", true, "自动打开浏览器（无图形界面环境会自动忽略）")
 	rootCmd.AddCommand(webCmd)
 }
 
@@ -34,6 +37,9 @@ var webCmd = &cobra.Command{
   cftunnel web --port 8080  # 自定义端口
   cftunnel web --open=false # 不自动打开浏览器`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := config.Ensure(); err != nil {
+			return err
+		}
 		cfg, err := config.Load()
 		if err != nil {
 			return err
@@ -53,13 +59,19 @@ var webCmd = &cobra.Command{
 			cfg.Save()
 		}
 
+		if webHost != "" {
+			web.SetListenHost(webHost)
+		}
+
 		server := web.NewServer(cfg, port, Version)
 
-		if webOpen {
+		// 无图形界面环境（OpenWrt / 服务器 / 容器）打开浏览器没有意义，
+		// 只会产生 xdg-open 缺失的报错噪音
+		if webOpen && !web.IsHeadless() {
 			url := fmt.Sprintf("http://localhost:%s", port)
 			go server.OpenBrowser(url)
 		}
-
+		fmt.Println(config.PathsSummary())
 		return server.Start()
 	},
 }
