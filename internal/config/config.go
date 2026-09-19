@@ -3,7 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"sync"
+	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -24,6 +25,7 @@ type Config struct {
 // WebUIConfig Web 管理面板配置
 type WebUIConfig struct {
 	Port          string `yaml:"port"`           // Web UI 监听端口，默认 7860
+	Listen        string `yaml:"listen"`         // 监听地址；留空=auto（本机 127.0.0.1，无图形界面的 Linux/OpenWrt 为 0.0.0.0）
 	Username      string `yaml:"username"`       // 管理面板用户名（留空则无认证）
 	Password      string `yaml:"password"`       // 管理面板密码（留空则无认证）
 	Theme         string `yaml:"theme"`          // 主题: light / dark / system / monokai / dracula / nord
@@ -59,7 +61,74 @@ type AuthProxy struct {
 	Username   string `yaml:"username"`
 	Password   string `yaml:"password"`
 	SigningKey string `yaml:"signing_key,omitempty"`
-	CookieTTL  int    `yaml:"cookie_ttl,omitempty"` // 秒，默认 86400
+	CookieTTL  int    `yaml:"cookie_ttl,omitempty"`  // 秒，默认 86400
+	ListenPort int    `yaml:"listen_port,omitempty"` // 鉴权代理监听端口；0 表示按「目标端口+1」推导
+}
+
+// ServicePort 从 Service 中解析出端口号，失败返回 0。
+func (r RouteConfig) ServicePort() int {
+	s := r.Service
+	for _, prefix := range []string{"https://", "http://"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	idx := strings.LastIndex(s, ":")
+	if idx < 0 {
+		return 0
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(s[idx+1:]))
+	if err != nil || p <= 0 || p > 65535 {
+		return 0
+	}
+	return p
+}
+
+// AuthProxyPort 返回该路由鉴权代理应监听的端口；未启用鉴权或无法推导时返回 0。
+//
+// 🔴 必须是**确定性**的：远端 ingress 指向这个端口，端口一变就得重新推送。
+// 早期实现从「目标端口+1」开始探测第一个可用端口，一旦被占用就会漂移，
+// 造成 ingress 指向的端口与实际监听不一致——表现为 502，或者更糟：
+// ingress 还指向源站端口，认证被完全绕过。
+func (r RouteConfig) AuthProxyPort() int {
+	if r.Auth == nil {
+		return 0
+	}
+	if r.Auth.ListenPort > 0 {
+		return r.Auth.ListenPort
+	}
+	p := r.ServicePort()
+	if p <= 0 {
+		return 0
+	}
+	return p + 1
+}
+
+// AuthEnabled 表示该路由是否启用了鉴权，且凭据完整。
+func (r RouteConfig) AuthEnabled() bool {
+	return r.Auth != nil &&
+		strings.TrimSpace(r.Auth.Username) != "" &&
+		r.Auth.Password != ""
+}
+
+// IngressRoutes 返回**用于生成 ingress 规则**的路由视图：
+// 启用鉴权的路由，其 Service 会被替换为本地鉴权代理地址。
+//
+// 所有构造 ingress 规则的代码都必须用这个而不是 t.Routes，
+// 否则鉴权路由会被直接指向源站 —— 认证静默失效，且没有任何报错。
+func (t *TunnelConfig) IngressRoutes() []RouteConfig {
+	if t == nil {
+		return nil
+	}
+	out := make([]RouteConfig, 0, len(t.Routes))
+	for _, r := range t.Routes {
+		if !r.AuthEnabled() {
+			out = append(out, r)
+			continue
+		}
+		mapped := r
+		mapped.Service = "http://127.0.0.1:" + strconv.Itoa(r.AuthProxyPort())
+		out = append(out, mapped)
+	}
+	return out
 }
 
 // CookieTTLOrDefault 返回 Cookie 有效期（秒），默认 86400
@@ -96,51 +165,9 @@ type SelfUpdateConfig struct {
 	AutoCheck bool `yaml:"auto_check"` // 启动时自动检查 cftunnel 更新
 }
 
-var (
-	dirOnce    sync.Once
-	dirPath    string
-	isPortable bool
-	logOnce    sync.Once
-	logPath    string
-)
+// 路径与模式解析见 paths.go（Dir / LogDir / BinDir / RunDir / Mode / Ensure）。
 
-// Dir 返回配置目录路径
-// Dir returns the config directory next to the running executable.
-func Dir() string {
-	dirOnce.Do(func() {
-		if exe, err := os.Executable(); err == nil {
-			if real, err := filepath.EvalSymlinks(exe); err == nil {
-				exeDir := filepath.Dir(real)
-				dirPath = filepath.Join(exeDir, "config")
-				isPortable = true
-				return
-			}
-		}
-		dirPath = "config"
-		isPortable = true
-	})
-	return dirPath
-}
-
-func LogDir() string {
-	logOnce.Do(func() {
-		if exe, err := os.Executable(); err == nil {
-			if real, err := filepath.EvalSymlinks(exe); err == nil {
-				logPath = filepath.Join(filepath.Dir(real), "log")
-				return
-			}
-		}
-		logPath = "log"
-	})
-	return logPath
-}
-
-// Portable 返回当前是否处于便携模式
-func Portable() bool {
-	Dir() // 确保 dirOnce 已执行
-	return isPortable
-}
-
+// Path 返回配置文件路径。
 func Path() string {
 	return filepath.Join(Dir(), "config.yml")
 }
@@ -174,6 +201,89 @@ func (c *Config) migrateSingleTunnel() {
 		c.Tunnel = TunnelConfig{}
 		c.Routes = nil
 	}
+}
+
+// ActiveTunnel 返回当前生效的隧道。
+// 统一取值入口：Tunnels 为唯一数据源，Tunnel/Routes 仅作为旧配置的兼容回退
+// （Loaded 时 migrateSingleTunnel 已完成搬运，正常情况下 Tunnels 非空）。
+func (c *Config) ActiveTunnel() *TunnelConfig {
+	if len(c.Tunnels) > 0 {
+		return &c.Tunnels[0]
+	}
+	if c.Tunnel.ID != "" {
+		return &c.Tunnel
+	}
+	return nil
+}
+
+// EnsureActiveTunnel 返回当前生效的可写隧道。
+// 若配置仍处于旧单隧道形态，会先归一化到 Tunnels 再返回；无隧道时返回 nil。
+func (c *Config) EnsureActiveTunnel() *TunnelConfig {
+	c.migrateSingleTunnel()
+	if len(c.Tunnels) > 0 {
+		return &c.Tunnels[0]
+	}
+	if c.Tunnel.ID != "" {
+		return &c.Tunnel
+	}
+	return nil
+}
+
+// ActiveTunnelID 返回当前生效隧道的 ID，无隧道返回空串。
+func (c *Config) ActiveTunnelID() string {
+	if t := c.ActiveTunnel(); t != nil {
+		return t.ID
+	}
+	return ""
+}
+
+// ActiveTunnelName 返回当前生效隧道的名称，无隧道返回空串。
+func (c *Config) ActiveTunnelName() string {
+	if t := c.ActiveTunnel(); t != nil {
+		return t.Name
+	}
+	return ""
+}
+
+// ActiveToken 返回当前生效隧道的 token，无隧道返回空串。
+func (c *Config) ActiveToken() string {
+	if t := c.ActiveTunnel(); t != nil {
+		return t.Token
+	}
+	return ""
+}
+
+// ActiveRoutes 返回当前生效隧道的路由列表。
+func (c *Config) ActiveRoutes() []RouteConfig {
+	if len(c.Tunnels) > 0 {
+		return c.Tunnels[0].Routes
+	}
+	return c.Routes
+}
+
+// AddActiveRoute 向当前生效隧道追加一条路由，并持久化到 Tunnels。
+// 返回 false 表示当前没有可用的隧道。
+func (c *Config) AddActiveRoute(r RouteConfig) bool {
+	if c.EnsureActiveTunnel() == nil {
+		return false
+	}
+	c.Tunnels[0].Routes = append(c.Tunnels[0].Routes, r)
+	return true
+}
+
+// RemoveActiveTunnel 移除当前生效的隧道（供 CLI destroy 使用）。
+// 返回 false 表示没有可移除的隧道。
+func (c *Config) RemoveActiveTunnel() bool {
+	if len(c.Tunnels) > 0 {
+		c.Tunnels = c.Tunnels[1:]
+		return true
+	}
+	if c.Tunnel.ID != "" {
+		c.Tunnel = TunnelConfig{}
+		c.Routes = nil
+		return true
+	}
+	return false
 }
 
 // FindTunnel 按 ID 查找隧道
@@ -270,6 +380,20 @@ func (c *Config) AllRoutes() []RouteConfig {
 	}
 	routes = append(routes, c.Routes...)
 	return routes
+}
+
+// IngressRoutes 返回所有隧道的路由（已应用鉴权代理映射）。
+// 需要构造 ingress 规则时应该用它，而不是 AllRoutes()。
+func (c *Config) IngressRoutes() []RouteConfig {
+	var out []RouteConfig
+	for i := range c.Tunnels {
+		out = append(out, c.Tunnels[i].IngressRoutes()...)
+	}
+	if len(c.Tunnels) == 0 {
+		legacy := TunnelConfig{Routes: c.Routes}
+		out = append(out, legacy.IngressRoutes()...)
+	}
+	return out
 }
 
 func (c *Config) FindRelayRule(name string) *RelayRule {
