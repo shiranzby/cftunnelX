@@ -56,6 +56,32 @@ jobs:
           mkdir -p dist
           VERSION="${GITHUB_REF_NAME:-dev}"
           go build -buildvcs=false -ldflags "-s -w -X github.com/shiranzby/cftunnelX/cmd.Version=${VERSION}" -o "dist/cftunnelX-${VERSION}-${GOOS}-${GOARCH}${{ matrix.ext }}" .
+      # 打包成 install.sh / install.ps1 / cftunnelX update 所期望的归档命名：
+      #   cftunnelX_<os>_<arch>.tar.gz （windows 为 .zip，内含 cftunnelX[.exe]）
+      # 归档内条目名必须是裸文件名，自更新的解包逻辑按该名称匹配。
+      - name: Package release archive (unix)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.goos != 'windows'
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p pkg
+          cp "dist/cftunnelX-${VERSION}-${GOOS}-${GOARCH}" pkg/cftunnelX
+          (cd pkg && tar czf "../dist/cftunnelX_${GOOS}_${GOARCH}.tar.gz" cftunnelX)
+          ls -l "dist/cftunnelX_${GOOS}_${GOARCH}.tar.gz"
+      - name: Package release archive (windows)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:GITHUB_REF_NAME
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item "dist/cftunnelX-$version-windows-amd64.exe" "pkg/cftunnelX.exe"
+          Compress-Archive -Path "pkg/cftunnelX.exe" -DestinationPath "dist/cftunnelX_windows_amd64.zip" -Force
+          Get-Item "dist/cftunnelX_windows_amd64.zip" | Select-Object Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: cftunnelX-cli-${{ matrix.goos }}-${{ matrix.goarch }}

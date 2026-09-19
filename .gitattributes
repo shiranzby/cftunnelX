@@ -1,0 +1,39 @@
+# 统一行尾与编码策略，避免 Windows 侧 CRLF/GBK 污染仓库源码。
+# 背景：历史上 install.sh / install.ps1 / install-relay.sh 曾因 UTF-8 被按 GBK
+# 解码后再重新编码而损坏（多字节字符尾字节变成 '?' 并吞掉换行），导致脚本语法错误。
+# 参见 CftunnelX 项目现状与问题清单 P0-2。
+
+* text=auto
+
+# Shell 脚本在 Linux/macOS 上直接执行，必须为 LF
+*.sh          text eol=lf
+*.bash        text eol=lf
+
+# Windows 脚本保持 CRLF；.ps1 另需 UTF-8 BOM（由仓库内容保证）
+*.ps1         text eol=crlf
+*.bat         text eol=crlf
+*.cmd         text eol=crlf
+
+# 其余文本统一 LF
+*.go          text eol=lf
+*.md          text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.json        text eol=lf
+*.toml        text eol=lf
+*.html        text eol=lf
+*.css         text eol=lf
+*.js          text eol=lf
+Dockerfile    text eol=lf
+Makefile      text eol=lf
+
+# 二进制资源不做转换
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.ico         binary
+*.mp4         binary
+*.zip         binary
+*.ipk         binary
+*.exe         binary
