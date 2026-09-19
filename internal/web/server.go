@@ -5,17 +5,19 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/shiranzby/cftunnelX/internal/config"
+	"github.com/shiranzby/cftunnelX/internal/daemon"
+	"github.com/shiranzby/cftunnelX/internal/ingress"
 )
 
 //go:embed index.html
@@ -30,6 +32,8 @@ type Server struct {
 	srv     *http.Server
 	version string
 	started time.Time
+	// stopCh 在服务关闭时关闭，用于通知后台自愈循环退出
+	stopCh chan struct{}
 }
 
 // NewServer 创建 Web UI 服务器
@@ -59,12 +63,74 @@ func NewServer(cfg *config.Config, port string, version string) *Server {
 		logLine("网络状态: 本机 IP %s", strings.Join(ips, ", "))
 	}
 
+	// 监听地址策略（详见 resolveListenHost）：
+	// 桌面环境默认只监听回环；无图形界面的 Linux/OpenWrt 默认监听所有网卡，
+	// 否则用户从局域网根本打不开管理面板。
+	host := resolveListenHost(cfg, port)
+	logLine("WebUI 监听地址: %s:%s", host, port)
+
+	s.stopCh = make(chan struct{})
+
 	s.srv = &http.Server{
-		Addr:    ":" + port,
-		Handler: s.authMiddleware(s.mux),
+		Addr:              host + ":" + port,
+		Handler:           s.authMiddleware(s.mux),
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return s
+}
+
+// listenHostOverride 由命令行 --host 传入，优先级最高。
+var listenHostOverride string
+
+// SetListenHost 设置监听地址覆盖值（供 cmd/web.go 的 --host 使用）。
+func SetListenHost(host string) {
+	listenHostOverride = strings.TrimSpace(host)
+}
+
+// resolveListenHost 解析实际监听地址。
+//
+// 优先级：命令行 --host > 配置 web_ui.listen > 自动判定。
+// 自动判定：开启远程访问或无图形界面（headless）时监听 0.0.0.0，否则只监听 127.0.0.1。
+// OpenWrt / 服务器 / 容器都没有 DISPLAY，必须监听所有网卡才能从局域网访问。
+func resolveListenHost(cfg *config.Config, port string) string {
+	return resolveListenHostFor(cfg, listenHostOverride, IsHeadless())
+}
+
+// resolveListenHostFor 是纯计算版本，便于单元测试。
+func resolveListenHostFor(cfg *config.Config, override string, headless bool) string {
+	if override != "" {
+		return override
+	}
+	if cfg != nil {
+		if listen := strings.TrimSpace(cfg.WebUI.Listen); listen != "" && listen != "auto" {
+			return listen
+		}
+		if cfg.WebUI.RemoteEnabled {
+			return "0.0.0.0"
+		}
+	}
+	if headless {
+		return "0.0.0.0"
+	}
+	return "127.0.0.1"
+}
+
+// IsHeadless 判断当前是否处于无图形界面环境。
+func IsHeadless() bool {
+	return isHeadlessFor(runtime.GOOS, os.Getenv("DISPLAY"), os.Getenv("WAYLAND_DISPLAY"))
+}
+
+// isHeadlessFor 判断逻辑：Windows 与 macOS 视为有图形界面；
+// 其他系统在既无 X11 也无 Wayland 会话时视为 headless（OpenWrt、服务器、容器）。
+func isHeadlessFor(goos, display, waylandDisplay string) bool {
+	switch goos {
+	case "windows", "darwin":
+		return false
+	default:
+		return display == "" && waylandDisplay == ""
+	}
 }
 
 func (s *Server) registerRoutes() {
@@ -113,44 +179,33 @@ func (s *Server) registerRoutes() {
 }
 
 // Start 启动服务器。
-// 如果端口已被占用（可能是已有实例），检测是否是 cftunnel 自身：
+// 如果监听地址已被占用（可能是已有实例），检测是否是 cftunnelX 自身：
 //   - 是 → 打开浏览器复用已有实例，返回 nil（不阻塞）
 //   - 否 → 返回错误
+//
+// 直接持有 net.Listener 并交给 Serve，不再"先探测再关闭再重新绑定"，
+// 从而消除端口被抢占的 TOCTOU 窗口。
 func (s *Server) Start() error {
-	port := s.srv.Addr
-	if strings.HasPrefix(port, ":") {
-		port = port[1:]
-	}
+	port := s.listenPort()
 
-	// 检测端口是否已被占用
 	listener, err := net.Listen("tcp", s.srv.Addr)
 	if err != nil {
-		// 端口被占用，检测是否是 cftunnel 自己的实例
-		url := "http://localhost:" + port + "/api/version"
-		resp, rerr := http.Get(url)
-		if rerr == nil {
-			defer resp.Body.Close()
-			var v map[string]string
-			json.NewDecoder(resp.Body).Decode(&v)
-			if ver, ok := v["version"]; ok && ver != "" {
-				// 已有 cftunnel 实例在运行，直接打开浏览器
-				fmt.Printf("检测到已有 cftunnel 实例运行在端口 %s，打开浏览器...\n", port)
-				s.OpenBrowser("http://localhost:" + port)
-				return nil
-			}
+		if s.reuseRunningInstance(port) {
+			return nil
 		}
-		// 端口被其他程序占用
-		return fmt.Errorf("端口 %s 已被占用且非 cftunnel 实例: %w", port, err)
+		return fmt.Errorf("端口 %s 已被占用且非 cftunnelX 实例: %w", port, err)
 	}
-	// 关闭检测用的 listener，让 s.srv.ListenAndServe 重新绑定
-	listener.Close()
 
 	go func() {
-		fmt.Printf("Web UI 启动在 http://localhost:%s\n", port)
-		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Web UI 启动失败: %v", err)
+		fmt.Printf("Web UI 启动在 http://%s\n", s.srv.Addr)
+		if serveErr := s.srv.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			// 不再使用 log.Fatalf：避免跳过所有 defer 清理直接退出进程
+			logLine("Web UI 服务异常退出: %v", serveErr)
 		}
 	}()
+
+	// 后台自愈：确保鉴权代理常驻进程存活，并在代理端口变化后重新同步 ingress
+	s.startAuthProxySupervisor()
 
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
@@ -158,9 +213,87 @@ func (s *Server) Start() error {
 	<-quit
 
 	fmt.Println("\n正在关闭 Web UI...")
+	close(s.stopCh)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return s.srv.Shutdown(ctx)
+}
+
+// startAuthProxySupervisor 周期性确保鉴权代理常驻进程存活。
+//
+// 为什么面板也要做这件事：代理进程可能被 OOM、被手动 kill、或自身崩溃。
+// 它一旦消失而隧道还在运行，远端 ingress 指向的端口就没人监听，
+// 用户看到的是 502 且不知道为什么。这里做到两件事：
+//  1. 发现代理不在就自动拉起（自愈）
+//  2. 代理端口集合发生变化时重新推送 ingress，避免 ingress 指向旧端口
+func (s *Server) startAuthProxySupervisor() {
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		lastPorts := ""
+
+		for {
+			select {
+			case <-s.stopCh:
+				return
+			case <-ticker.C:
+			}
+
+			cfg, err := config.Load()
+			if err != nil {
+				continue
+			}
+			ports := ingress.ProxyPorts(cfg)
+			if len(ports) == 0 {
+				lastPorts = ""
+				continue
+			}
+
+			wasRunning := daemon.AuthProxyRunning()
+			if _, err := daemon.StartAuthProxies(cfg); err != nil {
+				logLine("鉴权代理自愈失败: %v", err)
+				continue
+			}
+			if !wasRunning {
+				logLine("检测到鉴权代理未运行，已自动拉起（端口 %v）", ports)
+			}
+
+			key := fmt.Sprint(ports)
+			if key == lastPorts {
+				continue
+			}
+			lastPorts = key
+			if t := cfg.ActiveTunnel(); t != nil && daemon.RunningTunnel(t.ID) {
+				if err := ingress.Push(context.Background(), cfg, t.ID); err != nil {
+					logLine("鉴权代理端口变化后重新同步 ingress 失败: %v", err)
+				} else {
+					logLine("鉴权代理端口集合变化，ingress 已重新同步（%v）", ports)
+				}
+			}
+		}
+	}()
+}
+
+// reuseRunningInstance 探测端口上是否已有 cftunnelX 实例在运行。
+// 是则打开浏览器复用，返回 true。
+func (s *Server) reuseRunningInstance(port string) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/api/version")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var v map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return false
+	}
+	if v["version"] == "" {
+		return false
+	}
+	fmt.Printf("检测到已有 cftunnelX 实例运行在端口 %s，打开浏览器...\n", port)
+	s.OpenBrowser("http://127.0.0.1:" + port)
+	return true
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

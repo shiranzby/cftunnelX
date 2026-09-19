@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,6 +22,7 @@ import (
 	"github.com/shiranzby/cftunnelX/internal/cfapi"
 	"github.com/shiranzby/cftunnelX/internal/config"
 	"github.com/shiranzby/cftunnelX/internal/daemon"
+	"github.com/shiranzby/cftunnelX/internal/ingress"
 	"github.com/shiranzby/cftunnelX/internal/logutil"
 	"github.com/shiranzby/cftunnelX/internal/relay"
 	"github.com/shiranzby/cftunnelX/internal/service"
@@ -220,10 +220,14 @@ func checkCloudflaredReadOnly() map[string]interface{} {
 			result["version"] = strings.TrimSpace(string(out))
 		}
 	}
-	// 运行状态
-	if daemon.Running() {
+	// 运行状态：汇总多隧道 / 旧版单隧道 / 免域名三种 PID 文件。
+	// 只用 daemon.Running()（仅读 cloudflared.pid）会导致本接口与
+	// /api/status 的 RunningTunnels() 给出相反结论。
+	if inst := daemon.AnyRunning(); inst.Running {
 		result["running"] = true
-		result["pid"] = daemon.PID()
+		result["pid"] = inst.PID
+		result["scope"] = inst.Scope
+		result["pid_file"] = inst.PidFile
 	}
 	return result
 }
@@ -567,48 +571,55 @@ func (s *Server) handleTunnelUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 指定 id 时操作该隧道，未指定时操作当前生效隧道
+	tunnel := cfg.ActiveTunnel()
 	if tunnelID != "" {
-		// 多隧道模式
-		tunnel := cfg.FindTunnel(tunnelID)
-		if tunnel == nil {
-			writeError(w, 404, "隧道不存在")
-			return
+		tunnel = cfg.FindTunnel(tunnelID)
+	}
+	if tunnel == nil {
+		writeError(w, 400, "未配置隧道")
+		return
+	}
+	tunnelID = tunnel.ID
+	if daemon.RunningTunnel(tunnelID) {
+		writeError(w, 400, "隧道已在运行")
+		return
+	}
+
+	// 启动鉴权代理（独立常驻进程）。
+	// 必须在推送 ingress 之前完成：ingress 里写的是代理端口，
+	// 若代理没起就推送，用户会看到 502；若因此退回源站端口，认证就被绕过了。
+	if _, aerr := daemon.StartAuthProxies(cfg); aerr != nil {
+		writeError(w, 500, "鉴权代理未就绪: "+aerr.Error())
+		return
+	}
+	if gaps := ingress.CheckAuthProxies(cfg); len(gaps) > 0 {
+		msgs := make([]string, 0, len(gaps))
+		for _, g := range gaps {
+			msgs = append(msgs, g.String())
 		}
-		if daemon.RunningTunnel(tunnelID) {
-			writeError(w, 400, "隧道已在运行")
-			return
+		// 宁可拒绝启动，也不推送一份会绕过认证的 ingress
+		writeError(w, 500,
+			"以下路由启用了鉴权但鉴权代理未就绪，已中止以避免认证失效: "+strings.Join(msgs, "; "))
+		return
+	}
+
+	// 同步 ingress
+	if len(tunnel.Routes) > 0 {
+		client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
+		var rules []cfapi.IngressRule
+		for _, r := range tunnel.IngressRoutes() {
+			rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
 		}
-		// 同步 ingress
-		if len(tunnel.Routes) > 0 {
-			client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
-			var rules []cfapi.IngressRule
-			for _, r := range tunnel.Routes {
-				rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
-			}
-			if err := client.PushIngressConfig(context.Background(), tunnelID, rules); err != nil {
-				writeError(w, 500, err.Error())
-				return
-			}
-		}
-		logLine("启动隧道: %s (%s)", tunnel.Name, tunnelID)
-		if err := daemon.StartTunnel(tunnelID, tunnel.Token); err != nil {
+		if err := client.PushIngressConfig(context.Background(), tunnelID, rules); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
-	} else {
-		// 向后兼容单隧道
-		if cfg.Tunnel.Token == "" {
-			writeError(w, 400, "未配置隧道")
-			return
-		}
-		if daemon.Running() {
-			writeError(w, 400, "隧道已在运行")
-			return
-		}
-		if err := daemon.Start(cfg.Tunnel.Token); err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
+	}
+	logLine("启动隧道: %s (%s)", tunnel.Name, tunnelID)
+	if err := daemon.StartTunnel(tunnelID, tunnel.Token); err != nil {
+		writeError(w, 500, err.Error())
+		return
 	}
 
 	writeOK(w, map[string]string{"status": "starting"})
@@ -637,6 +648,52 @@ func (s *Server) handleTunnelDown(w http.ResponseWriter, r *http.Request) {
 
 // ========== 路由管理 ==========
 
+// routeView 对外暴露的路由信息。
+//
+// 🔴 刻意不包含 auth.password：面板在未配置管理账号时是默认无认证的，
+// 明文回显密码等于把它交给任何能访问该接口的人。调用方需要判断
+// "是否已设置密码"时看 HasPassword 即可。
+type routeView struct {
+	Name        string    `json:"name"`
+	Hostname    string    `json:"hostname"`
+	Service     string    `json:"service"`
+	ZoneID      string    `json:"zone_id,omitempty"`
+	DNSRecordID string    `json:"dns_record_id,omitempty"`
+	Auth        *authView `json:"auth,omitempty"`
+}
+
+type authView struct {
+	Username    string `json:"username"`
+	HasPassword bool   `json:"has_password"`
+	CookieTTL   int    `json:"cookie_ttl,omitempty"`
+	ListenPort  int    `json:"listen_port,omitempty"`
+}
+
+// sanitizeRoutes 把配置中的路由转成不含密文的安全视图。
+func sanitizeRoutes(cfg *config.Config) []routeView {
+	all := cfg.AllRoutes()
+	out := make([]routeView, 0, len(all))
+	for _, r := range all {
+		v := routeView{
+			Name:        r.Name,
+			Hostname:    r.Hostname,
+			Service:     r.Service,
+			ZoneID:      r.ZoneID,
+			DNSRecordID: r.DNSRecordID,
+		}
+		if r.Auth != nil {
+			v.Auth = &authView{
+				Username:    r.Auth.Username,
+				HasPassword: r.Auth.Password != "",
+				CookieTTL:   r.Auth.CookieTTL,
+				ListenPort:  r.AuthProxyPort(),
+			}
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -646,7 +703,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 返回所有隧道的所有路由（多隧道模式）
-		writeOK(w, cfg.AllRoutes())
+		writeOK(w, sanitizeRoutes(cfg))
 
 	case http.MethodPut:
 		// 路由更新（前端 inline 编辑后触发：先删后建）
@@ -717,7 +774,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			tunnel := cfg.FindTunnel(body.TunnelID)
 			if tunnel != nil {
 				var rules []cfapi.IngressRule
-				for _, r := range tunnel.Routes {
+				for _, r := range tunnel.IngressRoutes() {
 					rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
 				}
 				if err := client.PushIngressConfig(ctx, body.TunnelID, rules); err != nil {
@@ -770,16 +827,10 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 400, "隧道不存在")
 				return
 			}
-		} else if len(cfg.Tunnels) > 0 {
-			tunnel = &cfg.Tunnels[0] // 默认第一个
-		} else if cfg.Tunnel.ID != "" {
-			// 向后兼容
-			cfg.Tunnels = []config.TunnelConfig{cfg.Tunnel}
-			cfg.Tunnels[0].Routes = cfg.Routes
-			cfg.Tunnel = config.TunnelConfig{}
-			cfg.Routes = nil
-			tunnel = &cfg.Tunnels[0]
 		} else {
+			tunnel = cfg.EnsureActiveTunnel()
+		}
+		if tunnel == nil {
 			writeError(w, 400, "请先创建隧道")
 			return
 		}
@@ -843,7 +894,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var rules []cfapi.IngressRule
-		for _, r := range tunnel.Routes {
+		for _, r := range tunnel.IngressRoutes() {
 			rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
 		}
 		if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
@@ -869,7 +920,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 找到并删除路由（多隧道优先）
-		tunnelID, remainingRoutes, found, err := deleteRouteFromConfig(cfg, name)
+		tunnelID, _, found, err := deleteRouteFromConfig(cfg, name)
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
@@ -887,13 +938,14 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 
 		// 推送 ingress（使用正确的隧道 ID）
 		if tunnelID != "" {
-			var rules []cfapi.IngressRule
-			for _, r := range remainingRoutes {
-				rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+			// 从磁盘重读配置，再走统一的 ingress 推送入口
+			// （该入口会为鉴权路由换成代理端口）
+			fresh, lerr := config.Load()
+			if lerr != nil {
+				writeError(w, 500, lerr.Error())
+				return
 			}
-			cfg2, _ := config.Load()
-			client2 := cfapi.New(cfg2.Auth.APIToken, cfg2.Auth.AccountID)
-			if err := client2.PushIngressConfig(context.Background(), tunnelID, rules); err != nil {
+			if err := ingress.Push(context.Background(), fresh, tunnelID); err != nil {
 				writeError(w, 500, err.Error())
 				return
 			}
@@ -1261,75 +1313,24 @@ func (s *Server) handleRelayService(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// checkRelayServiceStatus 检查中继客户端系统服务状态
+// checkRelayServiceStatus 检查中继客户端系统服务状态。
+// 平台差异由 internal/service 处理（Linux systemd/OpenWrt procd、macOS LaunchDaemon、Windows 服务）。
 func checkRelayServiceStatus() map[string]interface{} {
-	switch runtime.GOOS {
-	case "windows":
-		out, err := hiddenCommand("sc", "query", "cftunnelX-relay").Output()
-		if err != nil {
-			return map[string]interface{}{"installed": false, "running": false}
-		}
-		running := strings.Contains(string(out), "RUNNING")
-		return map[string]interface{}{"installed": true, "running": running}
-	case "linux":
-		out, err := exec.Command("systemctl", "is-active", "cftunnelX-relay").Output()
-		if err != nil {
-			return map[string]interface{}{"installed": false, "running": false}
-		}
-		running := strings.TrimSpace(string(out)) == "active"
-		return map[string]interface{}{"installed": true, "running": running}
-	case "darwin":
-		out, err := exec.Command("launchctl", "list", "com.cftunnelX.frpc").Output()
-		if err != nil {
-			return map[string]interface{}{"installed": false, "running": false}
-		}
-		return map[string]interface{}{"installed": true, "running": len(out) > 0}
-	}
-	return map[string]interface{}{"installed": false, "running": false}
+	installed, running := service.ProgramStatus(service.RelayServiceName)
+	return map[string]interface{}{"installed": installed, "running": running}
 }
 
 func installRelayService(binPath string) error {
-	switch runtime.GOOS {
-	case "windows":
-		binArg := fmt.Sprintf(`%s -c %s`, binPath, relay.FrpcConfigPath())
-		if err := hiddenCommand("sc", "create", "cftunnelX-relay", "binPath=", binArg, "start=", "auto").Run(); err != nil {
-			return fmt.Errorf("创建服务失败: %w", err)
-		}
-		return hiddenCommand("sc", "start", "cftunnelX-relay").Run()
-	case "linux":
-		unit := fmt.Sprintf(`[Unit]
-Description=cftunnelX relay (frpc)
-After=network.target
-
-[Service]
-ExecStart=%s -c %s
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-`, binPath, relay.FrpcConfigPath())
-		if err := os.WriteFile("/etc/systemd/system/cftunnelX-relay.service", []byte(unit), 0644); err != nil {
-			return err
-		}
-		exec.Command("systemctl", "daemon-reload").Run()
-		return exec.Command("systemctl", "enable", "--now", "cftunnelX-relay").Run()
-	default:
-		return fmt.Errorf("当前平台不支持通过 Web 注册服务")
-	}
+	return service.InstallProgram(service.Program{
+		Name:   service.RelayServiceName,
+		Path:   binPath,
+		Args:   []string{"-c", relay.FrpcConfigPath()},
+		LogDir: config.LogDir(),
+	})
 }
 
 func uninstallRelayService() error {
-	switch runtime.GOOS {
-	case "windows":
-		hiddenCommand("sc", "stop", "cftunnelX-relay").Run()
-		return hiddenCommand("sc", "delete", "cftunnelX-relay").Run()
-	case "linux":
-		exec.Command("systemctl", "disable", "--now", "cftunnelX-relay").Run()
-		return os.Remove("/etc/systemd/system/cftunnelX-relay.service")
-	default:
-		return fmt.Errorf("当前平台不支持通过 Web 卸载服务")
-	}
+	return service.UninstallProgram(service.RelayServiceName)
 }
 
 // ========== Relay 服务端（frps） ==========
@@ -1345,22 +1346,10 @@ func (s *Server) handleRelayServer(w http.ResponseWriter, r *http.Request) {
 		version := ""
 		latestKnown := "0.66.0"
 
-		if runtime.GOOS == "windows" {
-			out, err := hiddenCommand("sc", "query", "frps").Output()
-			if err == nil {
-				installed = true
-				if strings.Contains(string(out), "RUNNING") {
-					running = true
-				}
-				status = strings.TrimSpace(string(out))
-			}
-		} else if runtime.GOOS == "linux" {
-			out, err := exec.Command("systemctl", "is-active", "frps").Output()
-			if err == nil {
-				installed = true
-				status = strings.TrimSpace(string(out))
-				running = status == "active"
-			}
+		if ok, run := service.ProgramStatus(service.FrpsServiceName); ok {
+			installed = true
+			running = run
+			status = "installed"
 		}
 		if out, err := hiddenCommand(relay.FrpsPath(), "--version").CombinedOutput(); err == nil {
 			version = strings.TrimSpace(string(out))
@@ -1400,24 +1389,17 @@ func (s *Server) handleRelayServer(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodDelete:
-		// 卸载 frps
-		if runtime.GOOS == "windows" {
-			hiddenCommand("sc", "stop", "frps").Run()
-			if err := hiddenCommand("sc", "delete", "frps").Run(); err != nil {
-				writeError(w, 500, err.Error())
-				return
-			}
-			frpsPath := relay.FrpsPath()
-			os.Remove(frpsPath)
-		} else if runtime.GOOS == "linux" {
-			exec.Command("systemctl", "disable", "--now", "frps").Run()
-			os.Remove("/etc/systemd/system/frps.service")
-			os.Remove("/usr/local/bin/frps")
-			os.RemoveAll("/etc/frps")
-		} else {
-			writeError(w, 400, "当前平台不支持卸载 frps 服务端")
+		// 卸载 frps（服务注册由 internal/service 统一处理平台差异）
+		if err := service.UninstallProgram(service.FrpsServiceName); err != nil {
+			writeError(w, 500, err.Error())
 			return
 		}
+		os.Remove(relay.FrpsPath())
+		os.Remove(relay.FrpsConfigPath())
+		// 清理由 install-relay.sh 创建的历史布局
+		os.Remove("/etc/systemd/system/frps.service")
+		os.Remove("/usr/local/bin/frps")
+		os.RemoveAll("/etc/frps")
 		writeOK(w, map[string]string{"status": "uninstalled"})
 
 	default:
@@ -1425,71 +1407,34 @@ func (s *Server) handleRelayServer(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// installFrpsServer 生成 frps 配置并注册为中继服务端。
+// 服务注册统一走 internal/service，避免在 Windows / Linux / OpenWrt 上各写一套模板。
 func installFrpsServer(port int) (string, error) {
 	binPath, err := relay.EnsureFrps()
 	if err != nil {
 		return "", err
 	}
 
-	// 生成 token
 	b := make([]byte, 16)
 	if _, err := crand.Read(b); err != nil {
 		return "", fmt.Errorf("生成 token 失败: %w", err)
 	}
 	token := hex.EncodeToString(b)
 
-	if runtime.GOOS == "windows" {
-		// Windows: 配置文件放 bin 同目录
-		configDir := filepath.Dir(binPath)
-		configPath := filepath.Join(configDir, "frps.toml")
-		configContent := fmt.Sprintf("bindPort = %d\nauth.token = %q\n", port, token)
-		if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
-			return "", err
-		}
-		// 注册 Windows 服务
-		binArg := fmt.Sprintf(`%s -c %s`, binPath, configPath)
-		if err := hiddenCommand("sc", "create", "frps", "binPath=", binArg, "start=", "auto").Run(); err != nil {
-			return "", fmt.Errorf("创建服务失败: %w", err)
-		}
-		if err := hiddenCommand("sc", "start", "frps").Run(); err != nil {
-			return "", fmt.Errorf("启动服务失败: %w", err)
-		}
-		return token, nil
-	}
-
-	// Linux: 安装到 /usr/local/bin
-	destBin := "/usr/local/bin/frps"
-	input, err := os.ReadFile(binPath)
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(destBin, input, 0755); err != nil {
-		return "", fmt.Errorf("复制 frps 失败（需要 sudo？）: %w", err)
-	}
-	configDir := "/etc/frps"
-	os.MkdirAll(configDir, 0755)
-	configPath := configDir + "/frps.toml"
-	configContent := fmt.Sprintf("bindPort = %d\nauth.token = %q\n", port, token)
+	configPath := relay.FrpsConfigPath()
+	configContent := fmt.Sprintf(`bindPort = %d
+auth.token = %q
+`, port, token)
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
-		return "", err
+		return "", fmt.Errorf("写入 frps 配置失败: %w", err)
 	}
-	unit := fmt.Sprintf(`[Unit]
-Description=frps relay server (cftunnel)
-After=network.target
 
-[Service]
-ExecStart=%s -c %s
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-`, destBin, configPath)
-	if err := os.WriteFile("/etc/systemd/system/frps.service", []byte(unit), 0644); err != nil {
-		return "", err
-	}
-	exec.Command("systemctl", "daemon-reload").Run()
-	if err := exec.Command("systemctl", "enable", "--now", "frps").Run(); err != nil {
+	if err := service.InstallProgram(service.Program{
+		Name:   service.FrpsServiceName,
+		Path:   binPath,
+		Args:   []string{"-c", configPath},
+		LogDir: config.LogDir(),
+	}); err != nil {
 		return "", err
 	}
 	return token, nil
@@ -1676,26 +1621,31 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 	// 增加详细提示
 	cfCheck["hint"] = getCloudflaredHint(cfCheck)
 
-	// 2. Cloudflare API 检测
+	// 2. Cloudflare API 检测（分层：Token 有效性 → Account ID → Zone 读取权限）
 	apiCheck := map[string]interface{}{"reachable": false}
 	if cfg.Auth.APIToken != "" {
 		client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		start := time.Now()
-		zones, err := client.ListZones(ctx)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		d := client.DiagnoseCredentials(ctx)
 		cancel()
-		apiCheck["latency_ms"] = time.Since(start).Milliseconds()
-		if err != nil {
-			apiCheck["err"] = err.Error()
-			apiCheck["hint"] = "API Token 无效或已过期，请前往 dash.cloudflare.com/profile/api-tokens 重新创建"
-		} else {
-			apiCheck["reachable"] = true
-			apiCheck["zone_count"] = len(zones)
-			apiCheck["hint"] = fmt.Sprintf("API 正常，账户下共 %d 个域名", len(zones))
+
+		apiCheck["reachable"] = d.Reachable()
+		apiCheck["latency_ms"] = d.LatencyMS
+		apiCheck["token_valid"] = d.TokenValid
+		apiCheck["token_status"] = d.TokenStatus
+		apiCheck["account_checked"] = d.AccountChecked
+		apiCheck["account_ok"] = d.AccountOK
+		apiCheck["account_message"] = d.AccountMessage
+		apiCheck["zones_checked"] = d.ZonesChecked
+		apiCheck["zones_ok"] = d.ZonesOK
+		apiCheck["zone_count"] = d.ZoneCount
+		apiCheck["hint"] = d.Hint
+		if !d.Reachable() {
+			apiCheck["err"] = d.TokenMessage
 		}
 	} else {
 		apiCheck["err"] = "API Token 未配置"
-		apiCheck["hint"] = "请先在仪表盘配置 API Token 和 Account ID"
+		apiCheck["hint"] = "请先在「基本配置」中填写 API Token 与 Account ID 并保存"
 	}
 
 	// 3. 收集所有路由（多隧道）
@@ -1742,7 +1692,12 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 	passed := 0
 	failed := 0
 	for _, r := range routeResults {
-		if r["local_ok"].(bool) && r["dns_ok"].(bool) {
+		localOK, _ := r["local_ok"].(bool)
+		dnsOK, _ := r["dns_ok"].(bool)
+		httpOK, _ := r["http_ok"].(bool)
+		host, _ := r["hostname"].(string)
+		// 与界面展示保持一致：本地服务 + DNS + 域名可达 三者都通过才算通
+		if localOK && dnsOK && (host == "" || httpOK) {
 			passed++
 		} else {
 			failed++
@@ -1760,7 +1715,10 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 		relayStatus = "中继服务器不可达"
 	}
 
+	envCheck := daemon.CheckEnvironmentForAPI()
+
 	writeOK(w, map[string]interface{}{
+		"environment": envCheck,
 		"cloudflared": cfCheck,
 		"api":         apiCheck,
 		"routes":      routeResults,
@@ -1781,7 +1739,9 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// diagnoseRouteReadOnly 只读路由诊断
+// diagnoseRouteReadOnly 只读路由诊断。
+// HTTPS 探测复用 daemon.ProbeHTTPS，从而把"不可达"细化为
+// 隧道未连接(530) / 源站不可达(502) / 路由缺失(404) / 证书缺失 / 超时 等具体原因。
 func diagnoseRouteReadOnly(route daemon.RouteInput) map[string]interface{} {
 	r := map[string]interface{}{
 		"name":     route.Name,
@@ -1801,7 +1761,7 @@ func diagnoseRouteReadOnly(route daemon.RouteInput) map[string]interface{} {
 			r["local_hint"] = fmt.Sprintf("本地服务 127.0.0.1:%s 正常监听", port)
 		} else {
 			r["local_err"] = "未监听"
-			r["local_hint"] = fmt.Sprintf("本地端口 %s 未监听，请确认服务已启动", port)
+			r["local_hint"] = fmt.Sprintf("本地端口 %s 未监听，请确认目标服务已启动并监听该端口", port)
 		}
 	} else {
 		r["local_err"] = "无法解析端口"
@@ -1817,20 +1777,21 @@ func diagnoseRouteReadOnly(route daemon.RouteInput) map[string]interface{} {
 			}
 		} else {
 			r["dns_err"] = "解析失败"
-			r["dns_hint"] = "DNS 解析失败，请检查 CNAME 是否已创建或等待 DNS 传播(可能需几分钟)"
+			r["dns_hint"] = "DNS 解析失败，请确认 CNAME 已创建且为「已代理」状态，并等待 DNS 传播（可能需几分钟）"
 		}
 	}
-	// HTTPS 可达性
+	// 域名可达性（含失败原因翻译）
 	if route.Hostname != "" && r["dns_ok"].(bool) {
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Get("https://" + route.Hostname)
-		if err == nil {
-			resp.Body.Close()
-			r["http_ok"] = true
-			r["http_hint"] = fmt.Sprintf("HTTPS 可达，状态码 %d", resp.StatusCode)
-		} else {
-			r["http_err"] = "不可达"
-			r["http_hint"] = "HTTPS 不可达，请确认隧道已启动且 ingress 已推送"
+		p := daemon.ProbeHTTPS(route.Hostname, 8*time.Second)
+		r["http_ok"] = p.OK
+		if p.Status != 0 {
+			r["http_status"] = p.Status
+		}
+		if !p.OK && p.Err != "" {
+			r["http_err"] = p.Err
+		}
+		if p.Hint != "" {
+			r["http_hint"] = p.Hint
 		}
 	}
 	return r
@@ -1841,12 +1802,14 @@ func getCloudflaredHint(cf map[string]interface{}) string {
 	installed, _ := cf["installed"].(bool)
 	running, _ := cf["running"].(bool)
 	if !installed {
-		return "cloudflared 未安装，请运行 'cftunnel up' 自动下载"
+		return "cloudflared 未安装或自动下载失败。请执行 'cftunnelX up' 触发下载（会走多个镜像源）"
 	}
 	if running {
-		return "cloudflared 运行中，隧道连接正常"
+		return "cloudflared 进程运行中。若域名仍不可达，请查看日志中是否出现 Registered tunnel connection"
 	}
-	return "cloudflared 已安装但未运行，请启动隧道"
+	return "cloudflared 已安装但未运行。仅填写 API/账号不会启动隧道：" +
+		"请在界面点击「启动隧道」，或执行 'cftunnelX up'；" +
+		"服务器长期运行可执行 'cftunnelX install' 注册开机自启"
 }
 
 // ========== Web 面板配置 ==========
@@ -1903,6 +1866,14 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Password != nil {
 			cfg.WebUI.Password = *body.Password
+		}
+		// 用户名与密码必须同时设置、或同时留空。
+		// 只设其一会让"认证看起来配好了、实际完全不生效"——远程请求会落到
+		// 免认证分支，而界面上还显示着已设置密码，属于会骗人的状态。
+		if (strings.TrimSpace(cfg.WebUI.Username) == "") != (cfg.WebUI.Password == "") {
+			writeError(w, 400,
+				"管理用户名与密码必须同时设置，或同时留空以关闭认证；只设置其中一项不会生效")
+			return
 		}
 		if body.Theme != "" {
 			cfg.WebUI.Theme = body.Theme
@@ -2105,7 +2076,7 @@ func ensureWebRemote(cfg *config.Config) error {
 	}
 
 	rules := make([]cfapi.IngressRule, 0, len(tunnel.Routes))
-	for _, route := range tunnel.Routes {
+	for _, route := range tunnel.IngressRoutes() {
 		rules = append(rules, cfapi.IngressRule{Hostname: route.Hostname, Service: route.Service})
 	}
 	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
@@ -2173,7 +2144,7 @@ func disableWebRemote(cfg *config.Config, tunnelName, serviceName, domain string
 	}
 	tunnel.Routes = append(tunnel.Routes[:routeIndex], tunnel.Routes[routeIndex+1:]...)
 	rules := make([]cfapi.IngressRule, 0, len(tunnel.Routes))
-	for _, r := range tunnel.Routes {
+	for _, r := range tunnel.IngressRoutes() {
 		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
 	}
 	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
@@ -2300,8 +2271,9 @@ func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error())
 			return
 		}
-		if cfg.Tunnel.Token == "" {
-			writeError(w, 400, "未配置隧道")
+		tunnel := cfg.ActiveTunnel()
+		if tunnel == nil || tunnel.Token == "" {
+			writeError(w, 400, "未配置隧道，请先创建隧道")
 			return
 		}
 		binPath, err := daemon.EnsureCloudflared()
@@ -2310,7 +2282,7 @@ func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		svc := service.New()
-		if err := svc.Install(binPath, cfg.Tunnel.Token); err != nil {
+		if err := svc.Install(binPath, tunnel.Token); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
@@ -2576,7 +2548,7 @@ func (s *Server) handleRoutesBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	// 推送 ingress
 	var rules []cfapi.IngressRule
-	for _, r := range tunnel.Routes {
+	for _, r := range tunnel.IngressRoutes() {
 		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
 	}
 	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
