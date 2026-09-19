@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -43,10 +42,13 @@ func TestResolvePathsOpenWrt(t *testing.T) {
 // TestResolvePathsSystemNotWritable 系统目录不可写时必须降级到用户目录，
 // 并记录 degraded 来源，供 CLI 打印警告。
 func TestResolvePathsSystemNotWritable(t *testing.T) {
-	// 模拟 /etc 与 /var 不可写，其余（用户目录）可写
-	sysUnwritable := func(p string) bool {
-		return !strings.HasPrefix(p, "/etc") && !strings.HasPrefix(p, "/var")
-	}
+	// 用 systemPaths() 的实际返回值构造"不可写"判定。
+	// 不要写死 /etc 与 /var：macOS 上系统路径是 /usr/local/etc 等，
+	// 写死会让本测试在 macOS CI 上把系统分支误判为可写（曾经如此）。
+	sysCfg, sysLog, sysBin, sysRun := systemPaths()
+	sysDirs := map[string]bool{sysCfg: true, sysLog: true, sysBin: true, sysRun: true}
+	sysUnwritable := func(p string) bool { return !sysDirs[p] }
+
 	cfgDir, _, _, _, mode, degraded := resolvePaths(
 		"/usr/local/bin", "", linuxSystemDirs, sysUnwritable)
 
@@ -56,8 +58,11 @@ func TestResolvePathsSystemNotWritable(t *testing.T) {
 	if degraded == "" {
 		t.Error("降级时应记录原系统目录")
 	}
-	if cfgDir == "" || strings.HasPrefix(cfgDir, "/etc") {
-		t.Errorf("降级后配置目录应在用户目录下, 实际 %q", cfgDir)
+	if cfgDir == "" {
+		t.Error("降级后配置目录不应为空")
+	}
+	if sysDirs[cfgDir] {
+		t.Errorf("降级后配置目录不应仍是系统目录, 实际 %q", cfgDir)
 	}
 }
 
