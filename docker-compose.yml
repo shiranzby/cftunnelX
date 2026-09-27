@@ -1,19 +1,35 @@
+# cftunnelX Docker 部署
+#
+# 用已发布的镜像直接跑（NAS / 服务器，推荐）：
+#     docker compose pull && docker compose up -d
+#
+# 从源码本地构建（开发用）—— 构建时用与下面 image 相同的标签，
+# compose 会优先使用本地镜像，不会去远端拉：
+#     docker build -t ghcr.io/shiranzby/cftunnelx:latest .
+#     docker compose up -d
+#
+# 镜像自带 cloudflared（按目标架构下载并置于 PATH），容器首次启动**无需联网下载**。
+# 镜像同时提供 linux/amd64 与 linux/arm64。
+
 services:
   cftunnelx:
-    build: .
-    image: cftunnelx:v4.93.2
+    image: ghcr.io/shiranzby/cftunnelx:${CFTUNNEL_IMAGE_TAG:-latest}
     container_name: cftunnelx
     restart: unless-stopped
     ports:
-      - "7860:7860"
+      # 左侧是宿主机端口，右侧固定为容器内端口（改左边即可换对外端口）
+      - "${CFTUNNEL_WEB_PORT:-7860}:7860"
     volumes:
       - cftunnelx-config:/app/config
       - cftunnelx-log:/app/log
     environment:
+      # 以下四项可为空，留空则在面板里配置
       CFTUNNEL_API_TOKEN: ${CFTUNNEL_API_TOKEN:-}
       CFTUNNEL_ACCOUNT_ID: ${CFTUNNEL_ACCOUNT_ID:-}
       CFTUNNEL_RELAY_SERVER: ${CFTUNNEL_RELAY_SERVER:-}
       CFTUNNEL_RELAY_TOKEN: ${CFTUNNEL_RELAY_TOKEN:-}
+      # 仅用于镜像的 HEALTHCHECK；若通过界面/参数改了容器内监听端口，这里要同步改
+      CFTUNNEL_HEALTHCHECK_PORT: "7860"
 
 volumes:
   cftunnelx-config:

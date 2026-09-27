@@ -44,13 +44,13 @@ go build -buildvcs=false -ldflags "-s -w" -o cftunnelX .
 Windows 浏览器 GUI 双击版：
 
 ```powershell
-go build -buildvcs=false -ldflags "-s -w -H=windowsgui" -o dist\cftunnelX-v4.93.2.exe .
+go build -buildvcs=false -ldflags "-s -w -H=windowsgui" -o dist\cftunnelX-v4.93.3.exe .
 ```
 
 Windows CLI：
 
 ```powershell
-go build -buildvcs=false -ldflags "-s -w" -o dist\cftunnelX-v4.93.2-cli.exe .
+go build -buildvcs=false -ldflags "-s -w" -o dist\cftunnelX-v4.93.3-cli.exe .
 ```
 
 构建内置 cloudflared 的版本（离线可用，二进制约 36 MB；每个架构需单独准备资源）：
@@ -99,18 +99,86 @@ Wails 输出文件为 `desktop-client/build/bin/cftunnelX-desktop.exe`。它是�
 
 | 文件 | 定位 | 行为 |
 | --- | --- | --- |
-| `dist/cftunnelX-v4.93.2.exe` | 浏览器 GUI 双击版 | 启动内置 Web 服务并用系统默认浏览器打开 |
+| `dist/cftunnelX-v4.93.3.exe` | 浏览器 GUI 双击版 | 启动内置 Web 服务并用系统默认浏览器打开 |
 | `desktop-client/build/bin/cftunnelX-desktop.exe` | Wails 桌面客户端 | 原生窗口嵌入 WebUI，并自动拉起同目录 CLI/Web 服务 |
-| `dist/cftunnelX-v4.93.2-windows-portable.zip` | Windows portable 包 | 包含 GUI、CLI、Wails 桌面端、README、LICENSE、依赖文件、`config/` 与 `log/` |
+| `dist/cftunnelX-v4.93.3-windows-portable.zip` | Windows portable 包 | 包含 GUI、CLI、Wails 桌面端、README、LICENSE、依赖文件、`config/` 与 `log/` |
 
 ## Docker
 
+镜像地址：`ghcr.io/shiranzby/cftunnelx`（**公开**，可直接拉取，无需登录）。提供 `linux/amd64` 与 `linux/arm64`。
+
 ```bash
-docker build -t cftunnelx:v4.93.2 .
+docker compose pull
 docker compose up -d
 ```
 
-默认端口为 `7860`，数据卷映射到 `/app/config` 与 `/app/log`。
+打开 `http://<主机IP>:7860` 即可使用面板。
+
+**镜像自带 cloudflared**（按目标架构下载并放入 `PATH`），容器首次启动不需要联网下载。
+本机也不含 `golang`/编译工具链，运行阶段基于 `alpine:3.22`。
+
+### 端口与数据
+
+| 项 | 说明 |
+| --- | --- |
+| 容器内端口 | `7860` |
+| 宿主机端口 | 通过 `CFTUNNEL_WEB_PORT` 调整，默认 `7860` |
+| 配置 | 命名卷 `cftunnelx-config` → `/app/config`（含 `config.yml` 与 `bin/cloudflared`） |
+| 日志 | 命名卷 `cftunnelx-log` → `/app/log` |
+
+### 环境变量（都可不填，留空则在面板里配置）
+
+| 变量 | 用途 |
+| --- | --- |
+| `CFTUNNEL_API_TOKEN` | Cloudflare API Token |
+| `CFTUNNEL_ACCOUNT_ID` | Cloudflare Account ID |
+| `CFTUNNEL_RELAY_SERVER` | 中继服务器地址（如 `1.2.3.4:7000`） |
+| `CFTUNNEL_RELAY_TOKEN` | 中继认证令牌 |
+| `CFTUNNEL_IMAGE_TAG` | 指定镜像版本，如 `v4.93.3`（默认 `latest`） |
+| `CFTUNNEL_WEB_PORT` | 宿主机映射端口（默认 `7860`） |
+| `CFTUNNEL_HEALTHCHECK_PORT` | 仅用于镜像健康检查，需与容器内实际监听端口一致 |
+| `CFTUNNEL_HOME` | 覆盖数据目录（默认走 `/app/config` + `/app/log`） |
+| `CFTUNNEL_CLOUDFLARED_URL` | 覆盖 cloudflared 下载地址；镜像已内置，一般不需要 |
+
+### 在 NAS 上部署（群晖 DSM / 绿联 UGOS Pro / 威联通 QTS）
+
+NAS 的容器管理界面通常只让你填「镜像名」，所以直接用镜像、不要走本地构建：
+
+1. 镜像填 `ghcr.io/shiranzby/cftunnelx:latest`（公开镜像，不需要登录）
+2. 端口映射：`7860` → `7860`（或自定义宿主机端口）
+3. 存储：建两个卷，分别挂到 `/app/config` 与 `/app/log`
+   - 若界面只支持"文件夹"映射（绑定挂载），先在该文件夹上执行 `chown -R 10001:10001 <目录>`，
+     否则非 root 用户写不进去
+4. 重启策略：`unless-stopped`
+5. 启动后访问 `http://<NAS_IP>:7860`，先设置面板管理账号密码
+
+架构对照：绿联 DXP4800/DXP4800 Plus、群晖 x86 机型用 `linux/amd64`；ARM 机型用 `linux/arm64`。
+（MIPS / RISC-V 型号没有 cloudflared 官方构建，请使用中继模式。）
+
+### 从源码本地构建
+
+```bash
+# 标签必须与 compose 里的 image 一致，compose 才会优先使用本地镜像
+docker build -t ghcr.io/shiranzby/cftunnelx:latest .
+docker compose up -d
+```
+
+多架构构建（需 buildx）：
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t <你的标签> .
+```
+
+### 注意事项
+
+- 容器以**非 root** 用户 `cftunnelx`（uid `10001`）运行。
+  - 用命名卷（上面的默认写法）：无需额外处理。
+  - 改用**绑定挂载**（如 `./config:/app/config`）：必须先 `chown -R 10001:10001 ./config`，否则因权限不足写不进去。
+- **不要在容器里执行 `cftunnelX install`**。容器没有 systemd，该命令会走降级分支生成启动脚本，没有意义；开机自启交给 `restart: unless-stopped`。
+- 首次访问面板前建议先设置管理账号密码。未配置凭据时只有私有网段来源可访问，公网来源会被拒绝。
+- 面板在容器内按无图形界面策略监听 `0.0.0.0`，因此宿主机与局域网可访问；如需改监听地址用 `--host` 或 `web_ui.listen`。
+- 自检：`docker inspect --format '{{.State.Health.Status}}' cftunnelx` 应返回 `healthy`。
+- 排查：`docker logs cftunnelx` 看启动输出；容器内日志文件在 `/app/log/cftunnelX.log`。
 
 ## OpenWrt
 

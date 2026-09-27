@@ -11,3 +11,8 @@ config.yml
 credentials*.json
 .workbuddy
 .claude
+
+# 本机为「内嵌 cloudflared 构建」准备资源目录。镜像里的 cloudflared 由 Dockerfile
+# 按目标架构下载放到 PATH，不能让本机那份进入构建上下文——否则做 arm64 镜像时
+# 可能混入 amd64 的二进制。
+internal/daemon/assets

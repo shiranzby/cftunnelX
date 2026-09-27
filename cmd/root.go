@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var Version = "v4.93.2"
+var Version = "v4.93.3"
 
 var rootCmd = &cobra.Command{
 	Use:     "cftunnelX",
