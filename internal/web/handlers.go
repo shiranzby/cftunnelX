@@ -1860,6 +1860,10 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 		oldTunnelName := strings.TrimSpace(cfg.WebUI.TunnelName)
 		oldServiceName := strings.TrimSpace(cfg.WebUI.ServiceName)
 		oldRemoteDomain := strings.TrimSpace(cfg.WebUI.RemoteDomain)
+		// 记录改前的凭据：改了密码必须让已登录的浏览器重新认证，
+		// 否则旧 Cookie 在有效期内仍能免登录进入，等于密码形同虚设。
+		oldUsername := cfg.WebUI.Username
+		oldPassword := cfg.WebUI.Password
 		// 指针判断：明确传值(含空字符串)才更新，支持留空关闭认证
 		if body.Username != nil {
 			cfg.WebUI.Username = *body.Username
@@ -1912,6 +1916,13 @@ func (s *Server) handleWebPanel(w http.ResponseWriter, r *http.Request) {
 		if err := cfg.Save(); err != nil {
 			writeError(w, 500, err.Error())
 			return
+		}
+		// 凭据变更后作废所有旧会话：改密码的目的就是让旧持有者无法继续访问，
+		// 若旧 Cookie 仍在有效期内免登录，密码形同虚设。
+		if oldUsername != cfg.WebUI.Username || oldPassword != cfg.WebUI.Password {
+			invalidateSessionsFor(cfg.WebUI.Username)
+			// 当前浏览器重新签发，避免用户刚改完就被自己挡在门外
+			setSessionCookie(w, createSession(cfg.WebUI.Username, cfg.WebUI.Password))
 		}
 		s.cfg = cfg
 		writeOK(w, map[string]string{"status": "ok"})

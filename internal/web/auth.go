@@ -97,6 +97,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// 登录端点本身必须免认证，否则未登录时无法提交凭据。
+		// 放在这里而不是 noAuthPaths，是因为那张表带前缀匹配，
+		// 收录 /api/session 会连带放行 /api/session/xxx 之类不存在的路径。
+		if r.URL.Path == "/api/session" {
+			s.handleSession(w, r)
+			return
+		}
 		// 非敏感的探测路径与静态资源放行
 		if isNoAuthPath(r.URL.Path) ||
 			strings.HasPrefix(r.URL.Path, "/static/") ||
@@ -110,16 +117,31 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if hasWebCredentials(cfg) {
-			user, pass, ok := r.BasicAuth()
-			if !ok ||
-				subtle.ConstantTimeCompare([]byte(user), []byte(cfg.WebUI.Username)) != 1 ||
-				subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.WebUI.Password)) != 1 {
-				denyUnauthorized(w, r, "认证失败")
+			// 已登录的会话直接放行。
+			// 这一支专门支撑浏览器发起的导航请求（跳转、地址栏回车、刷新），
+			// 它们不会携带 Authorization 头，只能靠会话 Cookie 识别。
+			if requestHasValidSession(r, cfg.WebUI.Username, cfg.WebUI.Password) {
+				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r)
+			user, pass, ok := r.BasicAuth()
+			if ok &&
+				subtle.ConstantTimeCompare([]byte(user), []byte(cfg.WebUI.Username)) == 1 &&
+				subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.WebUI.Password)) == 1 {
+				// 页面导航场景：直接签发会话，避免登录后跳转又要求认证
+				if !strings.HasPrefix(r.URL.Path, "/api/") {
+					setSessionCookie(w, createSession(cfg.WebUI.Username, cfg.WebUI.Password))
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			denyUnauthorized(w, r, "认证失败")
 			return
 		}
+		// 认证已关闭：作废所有历史会话，避免用户清空账号密码后
+		// 浏览器仍凭旧 Cookie 免登录进入。
+		invalidateSessionsFor("")
+		clearSessionCookie(w)
 		// 凭据只配了一半：属于配置错误，明确拒绝而不是静默放行。
 		// 旧行为下"只填密码不填用户名"会让远程请求落到免认证分支，
 		// 用户以为有密码保护，实际谁都能进。
@@ -173,7 +195,11 @@ func isPrivateClient(r *http.Request) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
-// denyUnauthorized 统一输出 401：API 返回 JSON，页面返回浏览器认证框。
+// denyUnauthorized 统一输出 401。
+//
+// API 请求返回 JSON；页面请求返回自绘登录页（login_page.go），
+// 刻意不再设置 WWW-Authenticate: Basic —— 那会触发浏览器内置弹窗，
+// 无法适配站点主题、无法展示品牌信息，在 Safari 上表现割裂。
 func denyUnauthorized(w http.ResponseWriter, r *http.Request, reason string) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -181,6 +207,40 @@ func denyUnauthorized(w http.ResponseWriter, r *http.Request, reason string) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": reason})
 		return
 	}
-	w.Header().Set("WWW-Authenticate", `Basic realm="cftunnelX"`)
-	http.Error(w, reason, http.StatusUnauthorized)
+	renderLoginPage(w, reason)
+}
+
+// handleSession 接收登录表单，校验通过后签发会话 Cookie。
+//
+// 为什么需要它：去掉 WWW-Authenticate 后浏览器不再自动保存凭据，
+// 而登录页跳转主页属于导航请求，不会携带 Authorization 头。
+// 用 Cookie 承载会话状态，导航与 fetch 才能同时通过认证。
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil || cfg == nil || !hasWebCredentials(cfg) {
+		writeError(w, 400, "未配置管理账号密码")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeError(w, 400, "请求格式错误")
+		return
+	}
+	user := r.PostFormValue("username")
+	pass := r.PostFormValue("password")
+	// 本机来源同样允许登录，便于本地调试
+	if subtle.ConstantTimeCompare([]byte(user), []byte(cfg.WebUI.Username)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.WebUI.Password)) != 1 {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "账号或密码不正确"})
+		return
+	}
+	setSessionCookie(w, createSession(cfg.WebUI.Username, cfg.WebUI.Password))
+	// 供前端 fetch 使用的 JSON 响应；表单提交场景会被浏览器导航覆盖
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
