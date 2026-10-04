@@ -46,12 +46,14 @@ body{
   width:100%; max-width:380px; background:var(--card); border:1px solid var(--line);
   border-radius:16px; box-shadow:var(--shadow); padding:32px 28px; text-align:center;
 }
+/* 与主页面 .logo 保持一致：白底、圆角、轻投影，深色下用浅底以免糊成一团 */
 .ico{
   width:52px; height:52px; margin:0 auto 18px; border-radius:12px;
-  display:grid; place-items:center; background:rgba(37,99,235,.1); color:var(--blue);
+  display:grid; place-items:center; background:#fff; overflow:hidden;
+  box-shadow:0 8px 18px rgba(37,99,235,.14);
 }
-.ico svg{width:26px;height:26px;stroke:currentColor;fill:none;stroke-width:1.8;
-  stroke-linecap:round;stroke-linejoin:round}
+.ico img{width:100%;height:100%;object-fit:contain;border-radius:12px}
+@media (prefers-color-scheme:dark){.ico{background:#fff}}
 h1{margin:0 0 6px; font-size:20px; font-weight:800; letter-spacing:.2px}
 .sub{margin:0 0 24px; font-size:13px; color:var(--muted)}
 label{display:block; text-align:left; font-size:12px; font-weight:700;
@@ -82,7 +84,7 @@ button:hover:not(:disabled){opacity:.9}
 </head>
 <body>
 <form class="card" id="f" method="post" action="/api/session" autocomplete="on">
-  <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V19a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19z"/><path d="M9.5 20.5v-6h5v6"/></svg></div>
+  <div class="ico"><img src="/assets/logo.png" alt="cftunnelX"></div>
   <h1>cftunnelX 控制台</h1>
   <p class="sub">需要登录后才能访问</p>
   <div class="err" id="e" role="alert"></div>
