@@ -202,7 +202,9 @@ func runWizard(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("路由 %s 已存在", routeName)
 	}
 
-	service := "http://localhost:" + port
+	// 127.0.0.1 而非 localhost：Linux 上 localhost 优先解析为 ::1，
+	// 服务只监听 IPv4 时 cloudflared 连 ::1 会 connection refused，表现为 502。
+	service := "http://127.0.0.1:" + port
 
 	fmt.Printf("正在添加路由: %s -> %s\n", domain, service)
 

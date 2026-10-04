@@ -167,7 +167,9 @@ func StartQuickBackground(port string) (<-chan string, error) {
 // startQuickProcess 启动单个 cloudflared 进程
 func startQuickProcess(binPath, port string, urlCh chan<- string) {
 	cfgPath := quickConfigPath()
-	cmd := exec.Command(binPath, "tunnel", "--config", cfgPath, "--url", "http://localhost:"+port)
+	// 127.0.0.1 而非 localhost：Linux 上 localhost 优先解析为 ::1，
+	// 服务只监听 IPv4 时会 connection refused，表现为 Cloudflare 502。
+	cmd := exec.Command(binPath, "tunnel", "--config", cfgPath, "--url", "http://127.0.0.1:"+port)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -273,7 +275,8 @@ func StartQuick(port string) error {
 	}
 
 	cfgPath := quickConfigPath()
-	cmd := exec.Command(binPath, "tunnel", "--config", cfgPath, "--url", "http://localhost:"+port)
+	// 127.0.0.1 而非 localhost，原因同上（::1 回环导致 502）
+	cmd := exec.Command(binPath, "tunnel", "--config", cfgPath, "--url", "http://127.0.0.1:"+port)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -357,7 +360,8 @@ func StartQuickWithAuth(port, username, password string) error {
 	fmt.Printf("鉴权代理已启动 127.0.0.1:%s → 127.0.0.1:%s\n", proxyPort, port)
 
 	cfgPath := quickConfigPath()
-	cmd := exec.Command(binPath, "tunnel", "--config", cfgPath, "--url", "http://localhost:"+proxyPort)
+	// 127.0.0.1 而非 localhost，原因同上（::1 回环导致 502）
+	cmd := exec.Command(binPath, "tunnel", "--config", cfgPath, "--url", "http://127.0.0.1:"+proxyPort)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {

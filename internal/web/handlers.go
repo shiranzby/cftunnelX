@@ -764,7 +764,10 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			route.Name = body.NewName
 		}
 		if body.Port != "" {
-			route.Service = "http://localhost:" + body.Port
+			// 必须用 127.0.0.1 而非 localhost：Linux 上 localhost 优先解析为
+			// ::1（IPv6 回环），而服务通常只监听 IPv4，cloudflared 连 ::1 会
+			// 得到 "connection refused"，表现为 Cloudflare 502。
+			route.Service = "http://127.0.0.1:" + body.Port
 		}
 		if body.Domain != "" {
 			route.Hostname = body.Domain
@@ -870,7 +873,8 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		svc := "http://localhost:" + port
+		// 127.0.0.1 而非 localhost，原因同上（::1 回环导致 502）
+		svc := "http://127.0.0.1:" + port
 		route := config.RouteConfig{
 			Name:        name,
 			Hostname:    domain,
@@ -2070,7 +2074,8 @@ func ensureWebRemote(cfg *config.Config) error {
 		}
 	}
 
-	service := "http://localhost:" + port
+	// 127.0.0.1 而非 localhost，原因同上（::1 回环导致 502）
+	service := "http://127.0.0.1:" + port
 	found := false
 	for i := range tunnel.Routes {
 		if tunnel.Routes[i].Name == serviceName {
@@ -2548,7 +2553,8 @@ func (s *Server) handleRoutesBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		tunnel.Routes = append(tunnel.Routes, config.RouteConfig{
-			Name: name, Hostname: domain, Service: "http://localhost:" + port,
+			// 127.0.0.1 而非 localhost，原因同上（::1 回环导致 502）
+			Name: name, Hostname: domain, Service: "http://127.0.0.1:" + port,
 			ZoneID: zone.ID, DNSRecordID: recordID,
 		})
 		added++

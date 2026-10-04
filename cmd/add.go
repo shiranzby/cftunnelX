@@ -56,7 +56,9 @@ var addCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name, port := args[0], args[1]
-		service := "http://localhost:" + port
+		// 127.0.0.1 而非 localhost：Linux 上 localhost 优先解析为 ::1，
+		// 服务只监听 IPv4 时 cloudflared 连 ::1 会 connection refused，表现为 502。
+		service := "http://127.0.0.1:" + port
 
 		cfg, err := config.Load()
 		if err != nil {
