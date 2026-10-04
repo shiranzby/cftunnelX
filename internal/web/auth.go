@@ -125,17 +125,23 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			user, pass, ok := r.BasicAuth()
-			if ok &&
-				subtle.ConstantTimeCompare([]byte(user), []byte(cfg.WebUI.Username)) == 1 &&
-				subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.WebUI.Password)) == 1 {
-				// 页面导航场景：直接签发会话，避免登录后跳转又要求认证
-				if !strings.HasPrefix(r.URL.Path, "/api/") {
-					setSessionCookie(w, createSession(cfg.WebUI.Username, cfg.WebUI.Password))
+			if ok {
+				if subtle.ConstantTimeCompare([]byte(user), []byte(cfg.WebUI.Username)) == 1 &&
+					subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.WebUI.Password)) == 1 {
+					// 页面导航场景：直接签发会话，避免登录后跳转又要求认证
+					if !strings.HasPrefix(r.URL.Path, "/api/") {
+						setSessionCookie(w, createSession(cfg.WebUI.Username, cfg.WebUI.Password))
+					}
+					next.ServeHTTP(w, r)
+					return
 				}
-				next.ServeHTTP(w, r)
+				// 带了凭据但校验不通过：明确提示错误
+				denyUnauthorized(w, r, "账号或密码不正确")
 				return
 			}
-			denyUnauthorized(w, r, "认证失败")
+			// 完全没有凭据：属正常状态（首次访问，或会话已过期）。
+			// 不传错误文案，否则用户还没输入任何东西就先看到"认证失败"。
+			denyUnauthorized(w, r, "")
 			return
 		}
 		// 认证已关闭：作废所有历史会话，避免用户清空账号密码后
@@ -240,7 +246,14 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setSessionCookie(w, createSession(cfg.WebUI.Username, cfg.WebUI.Password))
-	// 供前端 fetch 使用的 JSON 响应；表单提交场景会被浏览器导航覆盖
+	// 登录页是普通表单提交（action=/api/session），浏览器导航到本端点后
+	// 期望看到页面而不是 JSON。用 303 重定向回主页，
+	// 否则用户会停留在一段裸 JSON 上，以为登录失败。
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	// 供 XHR 调用的 JSON 响应
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
