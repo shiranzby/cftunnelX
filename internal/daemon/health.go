@@ -307,32 +307,39 @@ func probeTunnel(client *cfapi.Client, tunnelID string) probeResult {
 
 	conns, err := client.GetTunnelConnections(ctx, tunnelID)
 	if err != nil {
-		// 凭据/权限问题、隧道已被远端删除：都不代表"隧道卡死"，
-		// 重启也解决不了，一律按 unknown 处理，绝不自愈。
-		// 若把 403 当成"边缘可达 → stalled"，会让权限不足的用户
-		// 反复重启一个健康的隧道。
-		if cfapi.IsAuthError(err) {
-			return probeResult{HealthUnknown, -1, "API 凭据或权限不足，无法探测连接: " + err.Error()}
-		}
-		if cfapi.IsTunnelNotFound(err) {
-			return probeResult{HealthUnknown, -1, "隧道在 Cloudflare 侧不存在: " + err.Error()}
-		}
-
-		// API 不可达。关键区分：
-		//   能连上边缘 7844 ⇒ 网络通，是我方连接坏了 ⇒ stalled（重启有效）
-		//   连不上边缘     ⇒ 外部阻断 ⇒ blocked（重启无效，别动）
-		if edgeReachable() {
-			return probeResult{HealthStalled, -1,
-				fmt.Sprintf("api_ok=false, edge_reachable=true，按连接卡死处理: %v", err)}
-		}
-		return probeResult{HealthBlocked, -1,
-			fmt.Sprintf("api_ok=false, edge_reachable=false，外部阻断: %v", err)}
+		// 分类逻辑抽成纯函数，便于在无法做现场故障注入的环境里单测覆盖
+		return classifyAPIError(err, edgeReachable())
 	}
 
 	if len(conns) > 0 {
 		return probeResult{HealthHealthy, len(conns), ""}
 	}
 	return probeResult{HealthStalled, 0, "api_ok=true, connectors=0，进程在运行但没有任何活动连接"}
+}
+
+// classifyAPIError 把"查询连接数失败"翻译成健康态。
+//
+// 这是整套自愈里最关键的一次判断：判错会直接导致误重启（把健康隧道打死）
+// 或该重启时不动（隧道长期不可用）。因此单独拆成纯函数并用单测锁定每种组合。
+//
+//	权限不足 / 隧道已删除            → unknown（重启解决不了，绝不自愈）
+//	其余错误 + 边缘可达               → stalled（我方连接坏了，重启有效）
+//	其余错误 + 边缘也不可达           → blocked（外部阻断，重启无效且有害）
+func classifyAPIError(err error, edgeOK bool) probeResult {
+	if cfapi.IsAuthError(err) {
+		return probeResult{HealthUnknown, -1,
+			fmt.Sprintf("api_ok=false, 凭据或权限不足，无法探测连接: %v", err)}
+	}
+	if cfapi.IsTunnelNotFound(err) {
+		return probeResult{HealthUnknown, -1,
+			fmt.Sprintf("api_ok=false, 隧道在 Cloudflare 侧不存在: %v", err)}
+	}
+	if edgeOK {
+		return probeResult{HealthStalled, -1,
+			fmt.Sprintf("api_ok=false, edge_reachable=true，按连接卡死处理: %v", err)}
+	}
+	return probeResult{HealthBlocked, -1,
+		fmt.Sprintf("api_ok=false, edge_reachable=false，外部阻断: %v", err)}
 }
 
 // edgeReachable 判断本机能否建立到 Cloudflare 隧道边缘的 TCP 连接。

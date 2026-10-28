@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,6 +219,52 @@ func TestHealthFlapDoesNotResetBackoff(t *testing.T) {
 
 	if got := m.entries["t1"].restartStreak; got != 3 {
 		t.Fatalf("抖动期间退避被清零（restartStreak=%d），应保持 3", got)
+	}
+}
+
+// TestClassifyAPIError 锁定"查询失败 → 健康态"的映射矩阵。
+//
+// 这条分支在纯 WSL1 环境里无法做真实现场验证（iptables 不可用、
+// /etc/hosts 只影响 DNS 不影响直连探测），但它直接决定会不会误重启，
+// 所以必须用单测把每种组合钉死。
+func TestClassifyAPIError(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		edgeOK   bool
+		want     TunnelHealth
+		wantText string
+	}{
+		{"权限不足+边缘可达", errors.New("403 Forbidden"), true, HealthUnknown, "凭据或权限不足"},
+		{"权限不足+边缘不可达", errors.New("401 Unauthorized"), false, HealthUnknown, "凭据或权限不足"},
+		{"隧道已删除", errors.New("404 Not Found"), true, HealthUnknown, "不存在"},
+		{"超时+边缘可达→stalled", errors.New("dial tcp: i/o timeout"), true, HealthStalled, "edge_reachable=true"},
+		{"超时+边缘不可达→blocked", errors.New("dial tcp: i/o timeout"), false, HealthBlocked, "edge_reachable=false"},
+		{"DNS失败+边缘不可达→blocked", errors.New("no such host"), false, HealthBlocked, "edge_reachable=false"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyAPIError(tc.err, tc.edgeOK)
+			if got.state != tc.want {
+				t.Fatalf("state = %q，期望 %q", got.state, tc.want)
+			}
+			if !strings.Contains(got.detail, tc.wantText) {
+				t.Fatalf("detail = %q，应包含 %q", got.detail, tc.wantText)
+			}
+			if got.connectors != -1 {
+				t.Fatalf("查询失败时 connectors 应为 -1，实际 %d", got.connectors)
+			}
+		})
+	}
+}
+
+// TestBlockedNeverCountsAsStalled 强调 blocked 与 stalled 必须互斥：
+// 两者都表示"没连上"，但只有 stalled 允许重启。
+func TestBlockedNeverCountsAsStalled(t *testing.T) {
+	res := classifyAPIError(errors.New("dial tcp: i/o timeout"), false)
+	if res.state == HealthStalled {
+		t.Fatal("边缘不可达时不能判 stalled（会导致封锁期反复重启）")
 	}
 }
 
