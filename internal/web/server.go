@@ -207,12 +207,18 @@ func (s *Server) Start() error {
 	// 后台自愈：确保鉴权代理常驻进程存活，并在代理端口变化后重新同步 ingress
 	s.startAuthProxySupervisor()
 
+	// 后台自愈：隧道健康探测。
+	// 与鉴权代理不同，隧道的问题在于"进程活着但没连上 Cloudflare"，
+	// 单看进程状态发现不了，必须查 Cloudflare API 的活动连接数。
+	daemon.StartHealthMonitor()
+
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	fmt.Println("\n正在关闭 Web UI...")
+	daemon.StopHealthMonitor()
 	close(s.stopCh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

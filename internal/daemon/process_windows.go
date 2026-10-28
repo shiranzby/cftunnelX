@@ -49,3 +49,12 @@ func processKill(pid int) error {
 func configureCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 }
+
+// processTerminateGraceful 平滑终止。
+//
+// Windows 没有 SIGTERM 语义，cloudflared 也不处理 CTRL_BREAK 之外的软信号，
+// 因此沿用 processKill（TerminateProcess + 轮询）。grace 参数仅为与 Unix
+// 实现保持签名一致；这里已经在内部分段等待进程退出。
+func processTerminateGraceful(pid int, grace time.Duration) error {
+	return processKill(pid)
+}

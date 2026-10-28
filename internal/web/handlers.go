@@ -257,6 +257,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			pid = p
 			running = true
 		}
+		// 健康快照来自后台探测器（内存读，不影响本接口的响应速度）
+		hs := daemon.HealthOf(t.ID)
 		routes := make([]map[string]interface{}, 0, len(t.Routes))
 		for _, r := range t.Routes {
 			routes = append(routes, map[string]interface{}{
@@ -269,6 +271,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"running":     running,
 			"pid":         pid,
 			"routes":      routes,
+
+			// ---- 以下为「隧道可用性」字段，只增不改 ----
+			// running 只代表进程存在；连接是否活着要看 health / connectors。
+			// 这两者在"边缘不可达但进程不退出"时会分叉，正是本组字段存在的原因。
+			"health":             hs.Health,
+			"connectors":         hs.Connectors,
+			"last_registered_at": hs.LastRegisteredAt,
+			"last_checked_at":    hs.LastCheckedAt,
+			"restart_count_24h":  hs.RestartCount24h,
+			"health_detail":      hs.Detail,
 		})
 	}
 	if len(tunnels) > 0 {
@@ -302,10 +314,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				"name": r.Name, "hostname": r.Hostname, "service": r.Service, "auth": r.Auth != nil,
 			})
 		}
+		hs := daemon.HealthOf(cfg.Tunnel.ID)
 		result["cloud"] = map[string]interface{}{
 			"tunnels": []map[string]interface{}{{
 				"tunnel_id": cfg.Tunnel.ID, "tunnel_name": cfg.Tunnel.Name,
 				"running": running, "pid": pid, "routes": routes,
+
+				"health":             hs.Health,
+				"connectors":         hs.Connectors,
+				"last_registered_at": hs.LastRegisteredAt,
+				"last_checked_at":    hs.LastCheckedAt,
+				"restart_count_24h":  hs.RestartCount24h,
+				"health_detail":      hs.Detail,
 			}},
 		}
 	}
@@ -358,6 +378,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"memory_sys":    ms.Sys,
 		"kernel_memory": ms.Sys,
 		"log_count":     logLineCount(logFilePath()),
+		// 汇总后的隧道可用性。cloud_running 只说明"有进程在跑"，
+		// tunnel_health 才回答"公网到底通不通"。
+		"tunnel_health": daemon.OverallHealthOf(),
 		"traffic": map[string]interface{}{
 			"active_connections": runningCount(runningTunnels) + boolInt(relay.Running()),
 			"upload_speed":       int64(0),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	cf "github.com/cloudflare/cloudflare-go/v6"
 	"github.com/cloudflare/cloudflare-go/v6/shared"
@@ -51,6 +52,30 @@ func IsTunnelNotFound(err error) bool {
 	return strings.Contains(s, "404 Not Found") ||
 		strings.Contains(s, "not found") ||
 		strings.Contains(s, "does not exist")
+}
+
+// IsAuthError 判断错误是否为凭据/权限问题。
+//
+// 必须与"网络不可达"区分开：健康探测器在 API 调用失败后会去看边缘是否可达，
+// 若边缘可达就判定为 stalled 并触发重启。但权限不足时边缘当然是可达的，
+// 于是"Token 没给 Zero Trust 读权限"会被误判成"隧道卡死"，
+// 导致每过一个冷却周期就无谓重启一次健康的隧道。
+// 因此这类错误一律按 unknown 处理，不做任何自愈动作。
+func IsAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 大小写不敏感：Cloudflare 不同接口返回的文案并不统一
+	// （"Invalid API Token" / "Authentication error" / http 状态码都可能出现）
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "401") ||
+		strings.Contains(s, "403") ||
+		strings.Contains(s, "authentication error") ||
+		strings.Contains(s, "unauthorized") ||
+		strings.Contains(s, "forbidden") ||
+		strings.Contains(s, "invalid token") ||
+		strings.Contains(s, "invalid api token") ||
+		strings.Contains(s, "10000")
 }
 
 // ListTunnels 列出所有隧道
@@ -109,4 +134,43 @@ func (c *Client) GetTunnelToken(ctx context.Context, tunnelID string) (string, e
 		return "", fmt.Errorf("获取隧道 Token 失败: %w", err)
 	}
 	return *token, nil
+}
+
+// TunnelConnection 表示一条**活动**的隧道连接（一个 cloudflared 到边缘的 connIndex）。
+type TunnelConnection struct {
+	ColoName string    // 接入的 Cloudflare 数据中心，如 lax13
+	OpenedAt time.Time // 该连接建立时间
+}
+
+// GetTunnelConnections 查询指定隧道当前活动的连接列表。
+//
+// 关键语义（供上层判断健康度）：
+//   - 返回 nil error 且空切片 ⇒ API 可达，但隧道**没有任何连接**（stalled）。
+//   - 返回 error ⇒ API 本身不可达（网络阻断 / DNS / 鉴权），
+//     无法据此判断隧道好坏，上层需用边缘连通性进一步区分 blocked 与 stalled。
+//
+// Cloudflare 在连接断开后仍会短期保留记录（IsPendingReconnect=true），
+// 这些不计入活动连接，否则会把"已断但未过期"误判成健康。
+func (c *Client) GetTunnelConnections(ctx context.Context, tunnelID string) ([]TunnelConnection, error) {
+	page, err := c.api.ZeroTrust.Tunnels.Cloudflared.Connections.Get(ctx, tunnelID,
+		zero_trust.TunnelCloudflaredConnectionGetParams{
+			AccountID: cf.F(c.accountID),
+		})
+	if err != nil {
+		return nil, fmt.Errorf("查询隧道连接失败: %w", err)
+	}
+
+	out := make([]TunnelConnection, 0, len(page.Result))
+	for _, client := range page.Result {
+		for _, conn := range client.Conns {
+			if conn.IsPendingReconnect {
+				continue
+			}
+			out = append(out, TunnelConnection{
+				ColoName: conn.ColoName,
+				OpenedAt: conn.OpenedAt,
+			})
+		}
+	}
+	return out, nil
 }
