@@ -96,6 +96,130 @@ func TestMarkStalledOneShotUntilReleased(t *testing.T) {
 	}
 }
 
+// simulateRestartDone 模拟 restartTunnel 的 defer：解除标记、重设宽限、清空 stalled 计数。
+func simulateRestartDone(m *healthMonitor, id string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.entryLocked(id)
+	e.restarting = false
+	e.graceUntil = at.Add(RestartSettle)
+	e.stalledStreak = 0
+}
+
+// fire 把 stalled 计数推到阈值并返回是否触发重启。
+// 注意要"任一调用返回真即为真"：重启可能在第一次调用时就触发并置位
+// restarting，随后那次调用会被 restarting 拦住而返回 false。
+func fire(m *healthMonitor, id string, at time.Time) bool {
+	ok := false
+	for i := 1; i < StalledConfirm; i++ {
+		if m.markStalled(id, at) {
+			ok = true
+		}
+	}
+	if m.markStalled(id, at) {
+		ok = true
+	}
+	return ok
+}
+
+// TestRestartBackoffSequence 验证退避梯度：
+// 前两次立即重启（覆盖"重启一次就好"的常见情况），
+// 第三次起拉长间隔，避免"重启解决不了"时每 18 秒无限重启。
+func TestRestartBackoffSequence(t *testing.T) {
+	m := newTestMonitor()
+	base := time.Now()
+	m.startGraceIfNeeded("t1", base.Add(-time.Minute))
+
+	// 第 1 次：立即
+	if !fire(m, "t1", base) {
+		t.Fatal("第 1 次应立即可重启")
+	}
+	simulateRestartDone(m, "t1", base)
+
+	// 第 2 次：仍立即（隔一个宽限周期后）
+	t2 := base.Add(RestartSettle + 3*time.Second)
+	if !fire(m, "t1", t2) {
+		t.Fatal("第 2 次应仍可立即重启")
+	}
+	simulateRestartDone(m, "t1", t2)
+
+	// 第 3 次：进入 60s 退避
+	t3 := t2.Add(RestartSettle + 3*time.Second)
+	if !fire(m, "t1", t3) {
+		t.Fatal("第 3 次本身应被允许（退避是为下一次设置）")
+	}
+	simulateRestartDone(m, "t1", t3)
+
+	// 宽限刚过就再来 → 应被退避拦住
+	tooSoon := t3.Add(RestartSettle + 3*time.Second)
+	if fire(m, "t1", tooSoon) {
+		t.Fatalf("第 3 次之后应进入退避，%.0fs 后又重启了", tooSoon.Sub(t3).Seconds())
+	}
+
+	// 退避期满 → 允许
+	afterBackoff := t3.Add(RestartBackoff[2] + time.Second)
+	if !fire(m, "t1", afterBackoff) {
+		t.Fatal("退避期满后应允许重启")
+	}
+}
+
+// TestStableHealthyResetsBackoff 验证持续健康够久才清零退避，
+// 短暂 healthy 不能清零（否则抖动会让退避失效）。
+func TestStableHealthyResetsBackoff(t *testing.T) {
+	m := newTestMonitor()
+	base := time.Now()
+
+	m.mu.Lock()
+	e := m.entryLocked("t1")
+	e.restartStreak = 4
+	e.nextRestartAt = base.Add(15 * time.Minute)
+	m.mu.Unlock()
+
+	// 第一次 healthy：记录起点，但不足以清零
+	m.apply("t1", HealthHealthy, 4, base, "")
+	if got := m.entries["t1"].restartStreak; got != 4 {
+		t.Fatalf("单次 healthy 就清零了退避（restartStreak=%d），会被抖动骗过去", got)
+	}
+
+	// 未满稳定期仍不清零
+	m.apply("t1", HealthHealthy, 4, base.Add(HealthyStableFor/2), "")
+	if got := m.entries["t1"].restartStreak; got != 4 {
+		t.Fatalf("稳定期未满就清零了（restartStreak=%d）", got)
+	}
+
+	// 超过稳定期 → 清零
+	m.apply("t1", HealthHealthy, 4, base.Add(HealthyStableFor+time.Second), "")
+	if got := m.entries["t1"].restartStreak; got != 0 {
+		t.Fatalf("持续健康 %s 后应清零退避，实际 restartStreak=%d", HealthyStableFor, got)
+	}
+	if !m.entries["t1"].nextRestartAt.IsZero() {
+		t.Fatal("清零退避时应同时清空 nextRestartAt")
+	}
+}
+
+// TestHealthFlapDoesNotResetBackoff 验证健康/断连反复抖动不会反复清零退避。
+func TestHealthFlapDoesNotResetBackoff(t *testing.T) {
+	m := newTestMonitor()
+	base := time.Now()
+
+	m.mu.Lock()
+	m.entryLocked("t1").restartStreak = 3
+	m.mu.Unlock()
+
+	// healthy 10 秒 → stalled → healthy 10 秒 …… 反复
+	at := base
+	for i := 0; i < 5; i++ {
+		m.apply("t1", HealthHealthy, 4, at, "")
+		at = at.Add(10 * time.Second)
+		m.apply("t1", HealthStalled, 0, at, "")
+		at = at.Add(3 * time.Second)
+	}
+
+	if got := m.entries["t1"].restartStreak; got != 3 {
+		t.Fatalf("抖动期间退避被清零（restartStreak=%d），应保持 3", got)
+	}
+}
+
 // TestNoLongThresholds 锁定"断连即重启"的策略：
 // 若有人把确认次数或宽限改得过大，这里会失败。
 func TestNoLongThresholds(t *testing.T) {

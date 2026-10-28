@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -57,6 +58,30 @@ var (
 	// 完成边缘注册的宽限时间。没有它，会在进程刚起来、还没注册完时就判死
 	// 并杀掉，陷入"启动→3 秒后被杀→再启动"的死循环。
 	RestartSettle = 15 * time.Second
+	// HealthyStableFor 连续 healthy 达到该时长，才清零重启计数与退避。
+	//
+	// 必须"持续"而不是"一次"：偶发抖动造成的短暂 healthy 会让退避失效，
+	// 一抖动又回到"立即重启"。
+	HealthyStableFor = 60 * time.Second
+	// RestartBackoff 连续重启却始终恢复不了时的退避梯度。
+	//
+	// 索引 = 本隧道自上次稳定健康以来已重启的次数：
+	//   第 1 次 → 0（立即）      常见情况：重启一次就好
+	//   第 2 次 → 0（立即）      覆盖"第一次恰好赶上坏时机"
+	//   第 3 次 → 60s           从此开始怀疑重启是不是根本没用
+	//   第 4 次 → 5min
+	//   第 5 次起 → 15min（封顶）
+	//
+	// 为什么需要它：RestartSettle 只保证"不误杀启动中的进程"，不构成熔断。
+	// 一旦故障是"重启解决不了的"（网络确实不通、注册不上），宽限一过就会
+	// 再次判定并重启，实测形成每 18 秒一次的无限重启风暴 —— 每次都瞬断
+	// 该隧道的全部在途连接。退避把这种空转压到可接受频率。
+	//
+	// 注意这不违反"断连就重启"：真正能靠重启恢复的断连，在第 1~2 次就恢复了，
+	// 根本走不到退避分支。
+	RestartBackoff = []time.Duration{
+		0, 0, time.Minute, 5 * time.Minute, 15 * time.Minute,
+	}
 	// RestartGrace 平滑重启时 SIGTERM 后等待退出的宽限期。
 	RestartGrace = 5 * time.Second
 	// EdgeProbeTimeout 边缘连通性探测超时。
@@ -83,6 +108,11 @@ type healthEntry struct {
 	stalledStreak int       // 连续判定为 stalled 的次数
 	graceUntil    time.Time // 在此之前不做重启决策（等 cloudflared 注册）
 	restarting    bool      // 重启进行中，避免并发重复触发
+
+	restartStreak  int       // 自上次稳定健康以来已自动重启的次数，用于退避
+	nextRestartAt  time.Time // 退避窗口：在此之前不再重启
+	healthySince   time.Time // 连续 healthy 的起点，用于清零 restartStreak
+	lastBackoffLog time.Time // 退避日志节流
 }
 
 // HealthSnapshot 是对外暴露的只读快照。
@@ -292,15 +322,17 @@ func probeTunnel(client *cfapi.Client, tunnelID string) probeResult {
 		//   能连上边缘 7844 ⇒ 网络通，是我方连接坏了 ⇒ stalled（重启有效）
 		//   连不上边缘     ⇒ 外部阻断 ⇒ blocked（重启无效，别动）
 		if edgeReachable() {
-			return probeResult{HealthStalled, -1, "API 不可达但边缘可达，判定为连接卡死: " + err.Error()}
+			return probeResult{HealthStalled, -1,
+				fmt.Sprintf("api_ok=false, edge_reachable=true，按连接卡死处理: %v", err)}
 		}
-		return probeResult{HealthBlocked, -1, "无法连接 Cloudflare: " + err.Error()}
+		return probeResult{HealthBlocked, -1,
+			fmt.Sprintf("api_ok=false, edge_reachable=false，外部阻断: %v", err)}
 	}
 
 	if len(conns) > 0 {
 		return probeResult{HealthHealthy, len(conns), ""}
 	}
-	return probeResult{HealthStalled, 0, "进程在运行但没有任何活动连接"}
+	return probeResult{HealthStalled, 0, "api_ok=true, connectors=0，进程在运行但没有任何活动连接"}
 }
 
 // edgeReachable 判断本机能否建立到 Cloudflare 隧道边缘的 TCP 连接。
@@ -338,10 +370,28 @@ func (m *healthMonitor) apply(tunnelID string, state TunnelHealth, connectors in
 	e.connectors = connectors
 	e.lastChecked = now
 	e.detail = detail
+
+	backoffReset := false
 	if state == HealthHealthy {
 		e.lastRegistered = now
+		if e.healthySince.IsZero() {
+			e.healthySince = now
+		}
+		// 持续健康够久才认定"这条隧道真的好了"，清零退避。
+		// 只凭一次 healthy 就清零会被抖动骗过去。
+		if e.restartStreak > 0 && now.Sub(e.healthySince) >= HealthyStableFor {
+			e.restartStreak = 0
+			e.nextRestartAt = time.Time{}
+			backoffReset = true
+		}
+	} else {
+		e.healthySince = time.Time{}
 	}
 	m.mu.Unlock()
+
+	if backoffReset {
+		logf("隧道 %s 已持续健康 %s，退出退避（下次断连将立即重启）", tunnelID, HealthyStableFor)
+	}
 
 	// 日志放在锁外：logf 会做磁盘写入，持锁调用会拖慢 /api/status 的快照读。
 	if changed {
@@ -373,24 +423,54 @@ func (m *healthMonitor) resetStreak(tunnelID string) {
 // 返回 true 时调用方负责真正执行重启（本函数已把 restarting 置位）。
 func (m *healthMonitor) markStalled(tunnelID string, now time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	e := m.entryLocked(tunnelID)
 	e.stalledStreak++
 
-	// 三个前提：连续确认够次数、已过注册宽限、没有正在进行的重启
-	if e.stalledStreak < StalledConfirm {
-		return false
-	}
-	if now.Before(e.graceUntil) {
-		return false
-	}
-	if e.restarting {
-		return false
-	}
+	allow := false
+	var backoffWait time.Duration
+	var streak int
 
-	e.restarting = true
-	return true
+	// 三个前提：连续确认够次数、已过注册宽限、没有正在进行的重启
+	if e.stalledStreak >= StalledConfirm && !now.Before(e.graceUntil) && !e.restarting {
+		if now.Before(e.nextRestartAt) {
+			// 仍在退避窗口内：记录等待时长，供外层打一条节流日志
+			backoffWait = e.nextRestartAt.Sub(now)
+			streak = e.restartStreak
+		} else {
+			step := e.restartStreak
+			if step >= len(RestartBackoff) {
+				step = len(RestartBackoff) - 1
+			}
+			e.restarting = true
+			e.restartStreak++
+			// 为"下一次"尝试设置最早时间：本次退避梯度的取值
+			e.nextRestartAt = now.Add(RestartBackoff[step])
+			allow = true
+		}
+	}
+	m.mu.Unlock()
+
+	// 日志写在锁外：logf 是磁盘写，持锁会拖慢 /api/status 的快照读。
+	if backoffWait > 0 {
+		m.logBackoff(tunnelID, streak, backoffWait, now)
+	}
+	return allow
+}
+
+// logBackoff 在进入退避时打一条日志，同一隧道 60 秒内最多一条，避免刷屏。
+func (m *healthMonitor) logBackoff(tunnelID string, streak int, wait time.Duration, now time.Time) {
+	m.mu.Lock()
+	e := m.entryLocked(tunnelID)
+	should := now.Sub(e.lastBackoffLog) >= time.Minute
+	if should {
+		e.lastBackoffLog = now
+	}
+	m.mu.Unlock()
+
+	if should {
+		logf("隧道 %s 已连续重启 %d 次仍未恢复，进入退避：%s 后再试（重启可能无效，避免空转）",
+			tunnelID, streak, wait.Round(time.Second))
+	}
 }
 
 // recordRestart 记录一次自动重启，并顺手裁掉 24 小时之外的记录。
@@ -561,10 +641,14 @@ func (m *healthMonitor) overall() OverallHealth {
 	worst := HealthHealthy
 	var worstSince time.Time
 	seenHealthy := false
+	var healthySince time.Time // 全部健康时，取最晚进入 healthy 的那条（= 全部恢复的时刻）
 
 	for _, e := range m.entries {
 		if e.state == HealthHealthy {
 			seenHealthy = true
+			if e.stateSince.After(healthySince) {
+				healthySince = e.stateSince
+			}
 			continue
 		}
 		if rank(e.state) > rank(worst) {
@@ -573,7 +657,11 @@ func (m *healthMonitor) overall() OverallHealth {
 		}
 	}
 	if worst == HealthHealthy && seenHealthy {
-		return OverallHealth{State: HealthHealthy}
+		out := OverallHealth{State: HealthHealthy}
+		if !healthySince.IsZero() {
+			out.Since = healthySince.UTC().Format(time.RFC3339)
+		}
+		return out
 	}
 	if worst == HealthHealthy {
 		return OverallHealth{State: HealthUnknown}
