@@ -11,7 +11,7 @@ import (
 	"github.com/shiranzby/cftunnelX/internal/config"
 )
 
-// 隧道健康探测与分级自愈。
+// 隧道健康探测与自愈。
 //
 // 为什么需要这一层：
 //
@@ -20,16 +20,17 @@ import (
 //	于是进程永远"活着"：进程存活与隧道可用在这类故障下完全脱钩，
 //	面板/API/命令行全部显示 running，而公网已经 530/1033。
 //
-// 本文件的做法：周期性调用 Cloudflare API 查询隧道的**活动连接数**，
-// 得到四态结论，并按故障类型决定是否自愈——
+// 做法：以约 3 秒的间隔轮询 Cloudflare 的隧道活动连接列表（复用 keep-alive
+// 连接池，单次请求很小），得到四态结论；确认断连后立即重启**那一条**隧道。
 //
 //	healthy  有活动连接           不动作
-//	stalled  进程在，但 0 连接     持续达阈值后平滑重启（重启有效）
+//	stalled  进程在，但 0 连接     连续确认后立即重启（只重启这一条）
 //	blocked  Cloudflare 根本不可达  只记录，不重启（重启无效，徒增抖动）
-//	unknown  无法判定（未运行/无凭据）不动作
+//	unknown  无法判定（未运行/无凭据/无权限）不动作
 //
-// 刻意不做"定时无脑重启"：边缘整段被阻断时重启只会换来新一轮 timeout，
-// 还会瞬断该隧道上的全部在途连接（含 SSH）。
+// 关于 blocked 仍不重启：边缘 7844 整段不可达时，重启只能换来新一轮超时，
+// 且会瞬断该隧道全部在途连接（含 SSH 路由）。这与"断连就重启"不矛盾 ——
+// 能被重启解决的断连，前提是网络本身通、只是我方连接坏了。
 type TunnelHealth string
 
 const (
@@ -41,25 +42,27 @@ const (
 
 // 探测与自愈参数。
 //
-// 用 var 而非 const：单元测试需要缩短间隔来验证阈值逻辑。
+// 用 var 而非 const：单元测试需要缩短间隔来验证判定逻辑。
 // ⚠ 修改这些值应在 StartHealthMonitor 之前完成，运行期变更不保证生效。
 var (
-	// ProbeInterval 探测周期。
-	ProbeInterval = 30 * time.Second
+	// ProbeInterval 探测周期。接近实时；查询走 keep-alive 连接，
+	// 单次是几十毫秒的小请求，这个频率在 Cloudflare 的接口配额内。
+	ProbeInterval = 3 * time.Second
 	// ProbeTimeout 单次 Cloudflare API 查询的超时。
 	ProbeTimeout = 8 * time.Second
-	// StalledThreshold 连续 stalled 达到该时长才重启，避免启动瞬间误杀。
-	StalledThreshold = 90 * time.Second
-	// BlockedThreshold blocked 仅用于对外报告"已中断多久"，不触发重启。
-	BlockedThreshold = 60 * time.Second
-	// RestartCooldown 同一隧道两次自动重启的最小间隔，防风暴。
-	RestartCooldown = 15 * time.Minute
+	// StalledConfirm 连续多少次探测都"无连接"才判定为真断连。
+	// 取 2 是为了滤掉单次网络抖动的误报（约 3 秒），不是延迟策略。
+	StalledConfirm = 2
+	// RestartSettle 首次发现隧道在运行、以及每次重启之后，留给 cloudflared
+	// 完成边缘注册的宽限时间。没有它，会在进程刚起来、还没注册完时就判死
+	// 并杀掉，陷入"启动→3 秒后被杀→再启动"的死循环。
+	RestartSettle = 15 * time.Second
 	// RestartGrace 平滑重启时 SIGTERM 后等待退出的宽限期。
 	RestartGrace = 5 * time.Second
-	// PostRestartDelay 重启后等待多久再复检并写日志。
-	PostRestartDelay = 30 * time.Second
 	// EdgeProbeTimeout 边缘连通性探测超时。
 	EdgeProbeTimeout = 3 * time.Second
+	// configTTL 配置缓存有效期。3 秒轮询没必要每次都读盘解析 YAML。
+	configTTL = 15 * time.Second
 
 	// edgeProbeHost/Port 是 cloudflared 自己使用的边缘入口，
 	// 用它做"我能不能连出去"的判据最贴近真实情况。
@@ -70,12 +73,16 @@ var (
 // healthEntry 单条隧道的探测状态。所有字段受 healthMonitor.mu 保护。
 type healthEntry struct {
 	state          TunnelHealth
-	stateSince     time.Time // 进入当前状态的时间，用于阈值判断
+	stateSince     time.Time // 进入当前状态的时间
 	connectors     int       // 活动连接数；-1 表示未知
 	lastRegistered time.Time // 最近一次确认有连接的时间
 	lastChecked    time.Time
 	detail         string      // 判定依据，便于排查
-	restartTimes   []time.Time // 自动重启时间，用于冷却与 24h 计数
+	restartTimes   []time.Time // 自动重启时间，用于 24h 计数
+
+	stalledStreak int       // 连续判定为 stalled 的次数
+	graceUntil    time.Time // 在此之前不做重启决策（等 cloudflared 注册）
+	restarting    bool      // 重启进行中，避免并发重复触发
 }
 
 // HealthSnapshot 是对外暴露的只读快照。
@@ -98,6 +105,16 @@ type healthMonitor struct {
 	startOnce sync.Once
 	stopOnce  sync.Once
 	stopCh    chan struct{}
+
+	// 配置缓存：避免 3 秒一次读盘解析 YAML
+	cfgMu     sync.Mutex
+	cfgCache  *config.Config
+	cfgLoaded time.Time
+
+	// Cloudflare 客户端缓存：复用其底层 keep-alive 连接池
+	clientMu  sync.Mutex
+	client    *cfapi.Client
+	clientKey string
 }
 
 var monitor = &healthMonitor{
@@ -156,15 +173,14 @@ func (m *healthMonitor) safeProbe() {
 }
 
 func (m *healthMonitor) probeAll() {
-	cfg, err := config.Load()
-	if err != nil || cfg == nil {
+	cfg := m.loadConfig()
+	if cfg == nil {
 		return
 	}
 
-	client := buildProbeClient(cfg)
+	client := m.getClient(cfg)
 
 	// Load 时 migrateSingleTunnel 已把旧配置搬进 Tunnels，这里直接遍历即可。
-	// 极端情况下（未迁移成功）再兜底处理单隧道字段。
 	tunnels := cfg.Tunnels
 	if len(tunnels) == 0 && cfg.Tunnel.ID != "" {
 		tunnels = []config.TunnelConfig{cfg.Tunnel}
@@ -181,19 +197,48 @@ func (m *healthMonitor) probeAll() {
 	m.prune(tunnels)
 }
 
-func buildProbeClient(cfg *config.Config) *cfapi.Client {
+// loadConfig 带 TTL 的配置读取。隧道列表变动不频繁，每次轮询都全量解析没必要。
+func (m *healthMonitor) loadConfig() *config.Config {
+	m.cfgMu.Lock()
+	defer m.cfgMu.Unlock()
+
+	if m.cfgCache != nil && time.Since(m.cfgLoaded) < configTTL {
+		return m.cfgCache
+	}
+	cfg, err := config.Load()
+	if err != nil || cfg == nil {
+		return m.cfgCache // 读失败时沿用旧值，避免瞬时抖动导致漏探
+	}
+	m.cfgCache = cfg
+	m.cfgLoaded = time.Now()
+	return cfg
+}
+
+// getClient 复用同一个 Cloudflare 客户端，从而复用底层 keep-alive 连接池。
+// 这就是"保持一个连接做保活监测"的落点：不必每次探测都新建连接。
+func (m *healthMonitor) getClient(cfg *config.Config) *cfapi.Client {
 	if cfg == nil || cfg.Auth.APIToken == "" || cfg.Auth.AccountID == "" {
 		return nil
 	}
-	return cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
+	key := cfg.Auth.APIToken + "\x00" + cfg.Auth.AccountID
+
+	m.clientMu.Lock()
+	defer m.clientMu.Unlock()
+	if m.client != nil && m.clientKey == key {
+		return m.client
+	}
+	m.client = cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
+	m.clientKey = key
+	return m.client
 }
 
 func (m *healthMonitor) probeOne(client *cfapi.Client, t config.TunnelConfig) {
 	now := time.Now()
 
-	// 进程不在：不调 API，直接 unknown（null 态由 running 字段表达）
+	// 进程不在：不调 API，直接 unknown（运行态由 running 字段表达）
 	if !RunningTunnel(t.ID) {
 		m.apply(t.ID, HealthUnknown, -1, now, "进程未运行")
+		m.resetStreak(t.ID)
 		return
 	}
 
@@ -202,16 +247,19 @@ func (m *healthMonitor) probeOne(client *cfapi.Client, t config.TunnelConfig) {
 		return
 	}
 
+	// 首次发现该隧道在运行 → 给 cloudflared 留出注册时间
+	m.startGraceIfNeeded(t.ID, now)
+
 	res := probeTunnel(client, t.ID)
 	m.apply(t.ID, res.state, res.connectors, now, res.detail)
 
 	if res.state != HealthStalled {
+		m.resetStreak(t.ID)
 		return
 	}
-	if !m.shouldRestart(t.ID, now) {
+	if !m.markStalled(t.ID, now) {
 		return
 	}
-	m.markRestart(t.ID, now)
 	go m.restartTunnel(t.ID, t.Token)
 }
 
@@ -223,7 +271,6 @@ type probeResult struct {
 }
 
 // probeTunnel 只回答"现在是什么状态"，不修改任何状态、不做自愈。
-// 单独拆出来便于单元测试与重启后复检复用。
 func probeTunnel(client *cfapi.Client, tunnelID string) probeResult {
 	ctx, cancel := context.WithTimeout(context.Background(), ProbeTimeout)
 	defer cancel()
@@ -232,8 +279,8 @@ func probeTunnel(client *cfapi.Client, tunnelID string) probeResult {
 	if err != nil {
 		// 凭据/权限问题、隧道已被远端删除：都不代表"隧道卡死"，
 		// 重启也解决不了，一律按 unknown 处理，绝不自愈。
-		// 这一支尤其重要：若把 403 当成"边缘可达 → stalled"，
-		// 会让权限不足的用户每 15 分钟被无谓重启一次健康隧道。
+		// 若把 403 当成"边缘可达 → stalled"，会让权限不足的用户
+		// 反复重启一个健康的隧道。
 		if cfapi.IsAuthError(err) {
 			return probeResult{HealthUnknown, -1, "API 凭据或权限不足，无法探测连接: " + err.Error()}
 		}
@@ -296,35 +343,58 @@ func (m *healthMonitor) apply(tunnelID string, state TunnelHealth, connectors in
 	}
 	m.mu.Unlock()
 
-	// 日志放在锁外：logf 会做磁盘写入，持锁调用会拖慢 /api/status 的快照读，
-	// 违反"状态接口必须秒回"的约束。
+	// 日志放在锁外：logf 会做磁盘写入，持锁调用会拖慢 /api/status 的快照读。
 	if changed {
 		logf("隧道 %s 健康状态变更: %s（连接 %d）%s", tunnelID, state, connectors, detail)
 	}
 }
 
-// shouldRestart 判断是否满足重启条件：stalled 持续达阈值，且不在冷却期。
-func (m *healthMonitor) shouldRestart(tunnelID string, now time.Time) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// startGraceIfNeeded 首次发现隧道在运行时，给它留出注册宽限。
+func (m *healthMonitor) startGraceIfNeeded(tunnelID string, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	e, ok := m.entries[tunnelID]
-	if !ok || e.state != HealthStalled {
+	e := m.entryLocked(tunnelID)
+	if e.graceUntil.IsZero() {
+		e.graceUntil = now.Add(RestartSettle)
+	}
+}
+
+// resetStreak 清空连续 stalled 计数。
+func (m *healthMonitor) resetStreak(tunnelID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.entries[tunnelID]; ok {
+		e.stalledStreak = 0
+	}
+}
+
+// markStalled 累加连续 stalled 次数，并判断当前是否应当重启。
+// 返回 true 时调用方负责真正执行重启（本函数已把 restarting 置位）。
+func (m *healthMonitor) markStalled(tunnelID string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	e := m.entryLocked(tunnelID)
+	e.stalledStreak++
+
+	// 三个前提：连续确认够次数、已过注册宽限、没有正在进行的重启
+	if e.stalledStreak < StalledConfirm {
 		return false
 	}
-	if now.Sub(e.stateSince) < StalledThreshold {
+	if now.Before(e.graceUntil) {
 		return false
 	}
-	for _, rt := range e.restartTimes {
-		if now.Sub(rt) < RestartCooldown {
-			return false
-		}
+	if e.restarting {
+		return false
 	}
+
+	e.restarting = true
 	return true
 }
 
-// markRestart 记录一次自动重启，并顺手裁掉 24 小时之外的记录。
-func (m *healthMonitor) markRestart(tunnelID string, now time.Time) {
+// recordRestart 记录一次自动重启，并顺手裁掉 24 小时之外的记录。
+func (m *healthMonitor) recordRestart(tunnelID string, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -338,14 +408,33 @@ func (m *healthMonitor) markRestart(tunnelID string, now time.Time) {
 	e.restartTimes = append(kept, now)
 }
 
-// restartTunnel 平滑重启：SIGTERM → 宽限 → SIGKILL，然后重新拉起并复检。
+// restartTunnel 平滑重启**这一条**隧道：SIGTERM → 宽限 → SIGKILL，然后重新拉起。
+//
+// 只操作目标隧道的 PID 文件与进程，其余隧道完全不受影响。
 func (m *healthMonitor) restartTunnel(tunnelID, token string) {
+	defer func() {
+		// 无论成败都要解除标记并给出新一轮注册宽限，
+		// 否则该隧道会永远不再被自愈。
+		m.mu.Lock()
+		if e, ok := m.entries[tunnelID]; ok {
+			e.restarting = false
+			e.graceUntil = time.Now().Add(RestartSettle)
+			e.stalledStreak = 0
+		}
+		m.mu.Unlock()
+
+		if r := recover(); r != nil {
+			logf("隧道 %s 重启过程发生 panic（已恢复）: %v", tunnelID, r)
+		}
+	}()
+
 	if token == "" {
-		logf("隧道 %s 判定为 stalled，但配置里没有 token，无法自动重启", tunnelID)
+		logf("隧道 %s 判定为断连，但配置里没有 token，无法自动重启", tunnelID)
 		return
 	}
 
-	logf("隧道 %s 判定为 stalled 已超过 %s，开始自动平滑重启", tunnelID, StalledThreshold)
+	m.recordRestart(tunnelID, time.Now())
+	logf("隧道 %s 连接中断（stalled），立即重启该隧道", tunnelID)
 
 	if pid := TunnelPID(tunnelID); pid > 0 {
 		if err := processTerminateGraceful(pid, RestartGrace); err != nil {
@@ -353,31 +442,15 @@ func (m *healthMonitor) restartTunnel(tunnelID, token string) {
 		}
 	}
 	os.Remove(tunnelPIDPath(tunnelID))
-	time.Sleep(750 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	if err := StartTunnel(tunnelID, token); err != nil {
 		logf("隧道 %s 自动重启失败: %v", tunnelID, err)
 		return
 	}
-	logf("隧道 %s 已自动重启，%s 后复检", tunnelID, PostRestartDelay)
-
-	// 复检：把结果写进日志，便于确认自愈是否真的有效
-	select {
-	case <-m.stopCh:
-		return
-	case <-time.After(PostRestartDelay):
-	}
-
-	cfg, err := config.Load()
-	if err != nil || cfg == nil {
-		return
-	}
-	client := buildProbeClient(cfg)
-	if client == nil {
-		return
-	}
-	res := probeTunnel(client, tunnelID)
-	logf("隧道 %s 重启后复检: %s（连接 %d）%s", tunnelID, res.state, res.connectors, res.detail)
+	// 重启后的复检由探测循环自然完成：宽限期内不会再次重启，
+	// 注册成功后状态会切回 healthy 并单独记一条日志。
+	logf("隧道 %s 已重启，等待边缘注册（宽限 %s）", tunnelID, RestartSettle)
 }
 
 // entryLocked 取（必要时创建）条目。调用方必须已持有 m.mu。
@@ -420,9 +493,8 @@ func (m *healthMonitor) snapshot(tunnelID string) HealthSnapshot {
 	e, ok := m.entries[tunnelID]
 	if !ok {
 		return HealthSnapshot{
-			Health:        HealthUnknown,
-			Connectors:    -1,
-			OutageSeconds: 0,
+			Health:     HealthUnknown,
+			Connectors: -1,
 		}
 	}
 
@@ -500,7 +572,6 @@ func (m *healthMonitor) overall() OverallHealth {
 			worstSince = e.stateSince
 		}
 	}
-	// 全部 healthy
 	if worst == HealthHealthy && seenHealthy {
 		return OverallHealth{State: HealthHealthy}
 	}

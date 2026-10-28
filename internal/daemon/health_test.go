@@ -12,71 +12,117 @@ func newTestMonitor() *healthMonitor {
 	}
 }
 
-// TestShouldRestartRequiresThreshold 验证"卡死必须持续够久才重启"。
-// 这条是防误杀的核心：cloudflared 刚启动时短暂 0 连接是正常的。
-func TestShouldRestartRequiresThreshold(t *testing.T) {
+// TestMarkStalledRequiresConfirm 验证需要连续 N 次无连接才判定断连，
+// 避免单次网络抖动就重启（N 很小，反应时间仍在秒级）。
+func TestMarkStalledRequiresConfirm(t *testing.T) {
 	m := newTestMonitor()
 	now := time.Now()
-	m.apply("t1", HealthStalled, 0, now, "")
+	// 宽限已在过去，排除宽限干扰
+	m.startGraceIfNeeded("t1", now.Add(-time.Minute))
 
-	if m.shouldRestart("t1", now.Add(StalledThreshold-time.Second)) {
-		t.Fatalf("未达阈值就触发重启：阈值 %s", StalledThreshold)
+	for i := 1; i < StalledConfirm; i++ {
+		if m.markStalled("t1", now) {
+			t.Fatalf("第 %d 次探测就触发重启，阈值是 %d 次", i, StalledConfirm)
+		}
 	}
-	if !m.shouldRestart("t1", now.Add(StalledThreshold+time.Second)) {
-		t.Fatalf("已超过阈值却未触发重启：阈值 %s", StalledThreshold)
+	if !m.markStalled("t1", now) {
+		t.Fatalf("达到 %d 次确认后仍未触发重启", StalledConfirm)
 	}
 }
 
-// TestShouldRestartIgnoresHealthyAndBlocked 验证只有 stalled 才重启。
-func TestShouldRestartIgnoresHealthyAndBlocked(t *testing.T) {
+// TestMarkStalledBlockedBySettleWindow 验证注册宽限期内绝不重启。
+// 这是防止"启动→3 秒后被杀→再启动"死循环的关键。
+func TestMarkStalledBlockedBySettleWindow(t *testing.T) {
+	m := newTestMonitor()
 	now := time.Now()
+	m.startGraceIfNeeded("t1", now) // graceUntil = now + RestartSettle
 
-	healthy := newTestMonitor()
-	healthy.apply("t1", HealthHealthy, 4, now, "")
-	if healthy.shouldRestart("t1", now.Add(time.Hour)) {
-		t.Fatal("healthy 状态不应触发重启")
+	for i := 0; i < StalledConfirm+3; i++ {
+		if m.markStalled("t1", now) {
+			t.Fatal("注册宽限期内不应重启（否则会杀掉还没注册完的进程）")
+		}
 	}
 
-	blocked := newTestMonitor()
-	blocked.apply("t1", HealthBlocked, -1, now, "")
-	if blocked.shouldRestart("t1", now.Add(time.Hour)) {
-		t.Fatal("blocked 状态不应触发重启（外部阻断，重启无效）")
-	}
-
-	unknown := newTestMonitor()
-	unknown.apply("t1", HealthUnknown, -1, now, "")
-	if unknown.shouldRestart("t1", now.Add(time.Hour)) {
-		t.Fatal("unknown 状态不应触发重启")
+	// 宽限过后应当可以重启
+	if !m.markStalled("t1", now.Add(RestartSettle+time.Second)) {
+		t.Fatal("宽限已过且确认次数足够，应触发重启")
 	}
 }
 
-// TestShouldRestartHonorsCooldown 验证冷却期内不重复重启，冷却过后允许。
-func TestShouldRestartHonorsCooldown(t *testing.T) {
+// TestMarkStalledBlockedWhileRestarting 验证重启进行中不会重复触发。
+func TestMarkStalledBlockedWhileRestarting(t *testing.T) {
 	m := newTestMonitor()
 	now := time.Now()
-	m.apply("t1", HealthStalled, 0, now, "")
-	m.markRestart("t1", now)
+	m.startGraceIfNeeded("t1", now.Add(-time.Minute))
+	m.entries["t1"].restarting = true
 
-	if m.shouldRestart("t1", now.Add(RestartCooldown-time.Minute)) {
-		t.Fatalf("冷却期内仍然重启，冷却时间 %s", RestartCooldown)
-	}
-	if !m.shouldRestart("t1", now.Add(RestartCooldown+time.Minute)) {
-		t.Fatal("冷却期已过却仍不重启")
+	for i := 0; i < StalledConfirm+3; i++ {
+		if m.markStalled("t1", now) {
+			t.Fatal("重启进行中不应再次触发")
+		}
 	}
 }
 
-// TestMarkRestartPrunesOldEntries 验证 24 小时窗口外的重启记录被裁掉。
-func TestMarkRestartPrunesOldEntries(t *testing.T) {
+// TestMarkStalledOneShotUntilReleased 验证触发一次后必须等 restarting 释放，
+// 否则会连续重启同一条隧道。
+func TestMarkStalledOneShotUntilReleased(t *testing.T) {
+	m := newTestMonitor()
+	now := time.Now()
+	m.startGraceIfNeeded("t1", now.Add(-time.Minute))
+
+	triggerAt := now.Add(RestartSettle)
+	// 需要累积到 StalledConfirm 次才会触发
+	for i := 1; i < StalledConfirm; i++ {
+		if m.markStalled("t1", triggerAt) {
+			t.Fatalf("第 %d 次就触发，应等到第 %d 次", i, StalledConfirm)
+		}
+	}
+	if !m.markStalled("t1", triggerAt) {
+		t.Fatal("达到确认次数后应触发")
+	}
+	if m.markStalled("t1", triggerAt.Add(time.Second)) {
+		t.Fatal("restarting 未释放前不应再次触发")
+	}
+
+	// 模拟 restartTunnel 的 defer 释放
+	m.mu.Lock()
+	m.entries["t1"].restarting = false
+	m.entries["t1"].graceUntil = triggerAt.Add(RestartSettle)
+	m.entries["t1"].stalledStreak = 0
+	m.mu.Unlock()
+
+	if m.markStalled("t1", triggerAt.Add(time.Second)) {
+		t.Fatal("新一轮宽限期内不应立即重启")
+	}
+}
+
+// TestNoLongThresholds 锁定"断连即重启"的策略：
+// 若有人把确认次数或宽限改得过大，这里会失败。
+func TestNoLongThresholds(t *testing.T) {
+	if StalledConfirm > 3 {
+		t.Errorf("StalledConfirm = %d，过大；要求断连后秒级反应", StalledConfirm)
+	}
+	if ProbeInterval > 10*time.Second {
+		t.Errorf("ProbeInterval = %s，过大；要求接近实时监测", ProbeInterval)
+	}
+	if RestartSettle > 30*time.Second {
+		t.Errorf("RestartSettle = %s，过大；这是等注册的宽限，不是冷却策略", RestartSettle)
+	}
+	if RestartSettle <= 0 {
+		t.Error("RestartSettle 必须为正，否则会杀掉尚未注册完成的进程")
+	}
+}
+
+// TestRecordRestartPrunesOldEntries 验证 24 小时窗口外的重启记录被裁掉。
+func TestRecordRestartPrunesOldEntries(t *testing.T) {
 	m := newTestMonitor()
 	now := time.Now()
 
-	m.markRestart("t1", now.Add(-48*time.Hour))
-	m.markRestart("t1", now.Add(-25*time.Hour))
-	m.markRestart("t1", now.Add(-2*time.Hour))
+	m.recordRestart("t1", now.Add(-48*time.Hour))
+	m.recordRestart("t1", now.Add(-25*time.Hour))
+	m.recordRestart("t1", now.Add(-2*time.Hour))
 
-	// 冷却判断只看最近一次（-2h），但窗口裁剪应在 markRestart 内完成
-	snap := m.snapshot("t1")
-	if snap.RestartCount24h != 1 {
+	if snap := m.snapshot("t1"); snap.RestartCount24h != 1 {
 		t.Fatalf("24h 内重启计数 = %d，期望 1", snap.RestartCount24h)
 	}
 }
@@ -97,19 +143,36 @@ func TestSnapshotUnknownForUntrackedTunnel(t *testing.T) {
 	}
 }
 
+// TestSnapshotUnknownKeepsOutageZero unknown 表示"无法判定"，不是"中断"。
+// 隧道本来就处于停止状态时，不该累计出一个天文数字的中断时长。
+func TestSnapshotUnknownKeepsOutageZero(t *testing.T) {
+	m := newTestMonitor()
+	now := time.Now()
+
+	m.apply("t1", HealthUnknown, -1, now.Add(-3*time.Hour), "")
+	snap := m.snapshot("t1")
+
+	if snap.Health != HealthUnknown {
+		t.Fatalf("health = %q，期望 unknown", snap.Health)
+	}
+	if snap.OutageSeconds != 0 {
+		t.Fatalf("unknown 状态不应累计中断时长，实际 %d 秒", snap.OutageSeconds)
+	}
+}
+
 // TestSnapshotHealthyClearsOutage 验证恢复健康后中断时长归零。
 func TestSnapshotHealthyClearsOutage(t *testing.T) {
 	m := newTestMonitor()
 	now := time.Now()
 
 	m.apply("t1", HealthStalled, 0, now.Add(-5*time.Minute), "")
-	stalled := m.snapshot("t1")
-	if stalled.OutageSeconds <= 0 {
-		t.Fatalf("stalled 中断时长应大于 0，实际 %d", stalled.OutageSeconds)
+	if got := m.snapshot("t1").OutageSeconds; got <= 0 {
+		t.Fatalf("stalled 中断时长应大于 0，实际 %d", got)
 	}
 
 	m.apply("t1", HealthHealthy, 4, now, "")
 	healthy := m.snapshot("t1")
+
 	if healthy.Health != HealthHealthy {
 		t.Fatalf("health = %q，期望 healthy", healthy.Health)
 	}
@@ -162,31 +225,14 @@ func TestPruneRemovesStaleTunnels(t *testing.T) {
 	m.apply("keep", HealthHealthy, 1, now, "")
 	m.apply("drop", HealthStalled, 0, now, "")
 
-	m.prune(nil) // 全部清掉
+	m.prune(nil)
 	if len(m.entries) != 0 {
 		t.Fatalf("prune 后仍有 %d 条残留", len(m.entries))
 	}
 }
 
-// TestSnapshotUnknownKeepsOutageZero unknown 表示"无法判定"，不是"中断"。
-// 例如隧道本来就处于停止状态时，不该累计出一个天文数字的中断时长。
-func TestSnapshotUnknownKeepsOutageZero(t *testing.T) {
-	m := newTestMonitor()
-	now := time.Now()
-
-	m.apply("t1", HealthUnknown, -1, now.Add(-3*time.Hour), "")
-	snap := m.snapshot("t1")
-
-	if snap.Health != HealthUnknown {
-		t.Fatalf("health = %q，期望 unknown", snap.Health)
-	}
-	if snap.OutageSeconds != 0 {
-		t.Fatalf("unknown 状态不应累计中断时长，实际 %d 秒", snap.OutageSeconds)
-	}
-}
-
 // TestApplyResetsStateSinceOnTransition 验证状态变化时才重置计时，
-// 同状态重复探测不应刷新 stateSince（否则阈值永远达不到）。
+// 同状态重复探测不应刷新 stateSince。
 func TestApplyResetsStateSinceOnTransition(t *testing.T) {
 	m := newTestMonitor()
 	base := time.Now()
@@ -196,7 +242,7 @@ func TestApplyResetsStateSinceOnTransition(t *testing.T) {
 
 	m.apply("t1", HealthStalled, 0, base.Add(30*time.Second), "")
 	if !m.entries["t1"].stateSince.Equal(first) {
-		t.Fatal("同状态重复探测不应重置 stateSince，否则永远无法达到重启阈值")
+		t.Fatal("同状态重复探测不应重置 stateSince")
 	}
 
 	m.apply("t1", HealthHealthy, 2, base.Add(60*time.Second), "")
