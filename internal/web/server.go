@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shiranzby/cftunnelX/internal/authproxy"
 	"github.com/shiranzby/cftunnelX/internal/config"
 	"github.com/shiranzby/cftunnelX/internal/daemon"
 	"github.com/shiranzby/cftunnelX/internal/ingress"
@@ -226,6 +227,28 @@ func (s *Server) Start() error {
 	return s.srv.Shutdown(ctx)
 }
 
+// authProxyRetryDelay 鉴权代理自愈失败后的退避间隔。
+//
+// 之前是每 15 秒无脑重试且每次打一条日志，端口被占用时刷出 1 万多条
+// 「已自动拉起」——而实际上什么都没拉起来。退避 + 去重后既能持续自愈，
+// 又不会把日志和 CPU 淹掉。
+func authProxyRetryDelay(failures int) time.Duration {
+	steps := []time.Duration{
+		15 * time.Second,
+		30 * time.Second,
+		time.Minute,
+		2 * time.Minute,
+		5 * time.Minute,
+	}
+	if failures <= 0 {
+		return steps[0]
+	}
+	if failures > len(steps) {
+		return steps[len(steps)-1]
+	}
+	return steps[failures-1]
+}
+
 // startAuthProxySupervisor 周期性确保鉴权代理常驻进程存活。
 //
 // 为什么面板也要做这件事：代理进程可能被 OOM、被手动 kill、或自身崩溃。
@@ -233,11 +256,25 @@ func (s *Server) Start() error {
 // 用户看到的是 502 且不知道为什么。这里做到两件事：
 //  1. 发现代理不在就自动拉起（自愈）
 //  2. 代理端口集合发生变化时重新推送 ingress，避免 ingress 指向旧端口
+//
+// 🔴 两条硬约束（CFX-AUTHPROXY-INGRESS-001 的教训）：
+//   - 就绪判断必须是「端口上确实是我们的代理」，不是「端口有人在监听」
+//   - 代理未就绪时**绝不推送 ingress**：宁可维持现状/502，
+//     也不能把公网流量指向一个可能被别的服务占用的端口
+//
+// 另外刻意**不做"代理挂掉就回滚到源站端口"**：那样等于静默关掉认证，
+// 比 502 危险得多。这里的取舍是 fail-closed —— 不可用，但不放过未认证流量。
 func (s *Server) startAuthProxySupervisor() {
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
-		lastPorts := ""
+
+		var (
+			lastPushed string    // 最近一次成功推送的端口集合
+			lastErr    string    // 用于日志去重
+			failures   int       // 连续失败次数，驱动退避
+			nextTryAt  time.Time // 退避窗口
+		)
 
 		for {
 			select {
@@ -246,37 +283,72 @@ func (s *Server) startAuthProxySupervisor() {
 			case <-ticker.C:
 			}
 
+			if time.Now().Before(nextTryAt) {
+				continue
+			}
+
 			cfg, err := config.Load()
 			if err != nil {
 				continue
 			}
 			ports := ingress.ProxyPorts(cfg)
 			if len(ports) == 0 {
-				lastPorts = ""
+				lastPushed, lastErr, failures = "", "", 0
+				nextTryAt = time.Time{}
 				continue
 			}
 
-			wasRunning := daemon.AuthProxyRunning()
-			if _, err := daemon.StartAuthProxies(cfg); err != nil {
-				logLine("鉴权代理自愈失败: %v", err)
-				continue
-			}
-			if !wasRunning {
-				logLine("检测到鉴权代理未运行，已自动拉起（端口 %v）", ports)
-			}
-
-			key := fmt.Sprint(ports)
-			if key == lastPorts {
-				continue
-			}
-			lastPorts = key
-			if t := cfg.ActiveTunnel(); t != nil && daemon.RunningTunnel(t.ID) {
-				if err := ingress.Push(context.Background(), cfg, t.ID); err != nil {
-					logLine("鉴权代理端口变化后重新同步 ingress 失败: %v", err)
-				} else {
-					logLine("鉴权代理端口集合变化，ingress 已重新同步（%v）", ports)
+			// 1) 确保代理真实就绪
+			if len(authproxy.ProbePorts(ports)) > 0 {
+				started, serr := daemon.StartAuthProxies(cfg)
+				if serr == nil {
+					// StartAuthProxies 内部已等待就绪，这里再确认一次，
+					// 防止"进程起了但端口被抢"这类中间态
+					serr = authproxy.WaitReady(ports, 5*time.Second)
 				}
+				if serr != nil {
+					failures++
+					delay := authProxyRetryDelay(failures)
+					nextTryAt = time.Now().Add(delay)
+
+					// 日志去重：错误内容不变时不重复刷屏，只在首次与内容变化时记录
+					if serr.Error() != lastErr {
+						lastErr = serr.Error()
+						logLine("ERROR 鉴权代理未就绪（连续失败 %d 次，%s 后重试）：%v",
+							failures, delay, serr)
+						logLine("ERROR 本次不会推送 ingress，避免把公网流量指向错误端口")
+					}
+					continue
+				}
+				if started {
+					logLine("鉴权代理已启动并确认就绪（端口 %v）", ports)
+				}
+				failures, lastErr, nextTryAt = 0, "", time.Time{}
 			}
+
+			// 2) 端口集合变化时同步 ingress（此时代理已确认就绪）
+			key := fmt.Sprint(ports)
+			if key == lastPushed {
+				continue
+			}
+			t := cfg.ActiveTunnel()
+			if t == nil || !daemon.RunningTunnel(t.ID) {
+				continue
+			}
+			if err := ingress.Push(context.Background(), cfg, t.ID); err != nil {
+				// 推送失败也退避重试，不要每 15 秒打一次同样的错误
+				failures++
+				delay := authProxyRetryDelay(failures)
+				nextTryAt = time.Now().Add(delay)
+				if err.Error() != lastErr {
+					lastErr = err.Error()
+					logLine("ERROR 同步 ingress 失败（%s 后重试）：%v", delay, err)
+				}
+				continue
+			}
+			lastPushed = key
+			lastErr, failures = "", 0
+			logLine("鉴权代理端口集合变化，ingress 已重新同步（%v）", ports)
 		}
 	}()
 }

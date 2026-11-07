@@ -9,6 +9,7 @@ import (
 	"github.com/shiranzby/cftunnelX/internal/authproxy"
 	"github.com/shiranzby/cftunnelX/internal/cfapi"
 	"github.com/shiranzby/cftunnelX/internal/config"
+	"github.com/shiranzby/cftunnelX/internal/ingress"
 	"github.com/spf13/cobra"
 )
 
@@ -22,16 +23,19 @@ func init() {
 	rootCmd.AddCommand(addCmd)
 }
 
-// pushIngress 推送当前所有路由的 ingress 配置到远端
 // pushIngress 同步当前活动隧道的 ingress。
 //
 // 注意用的是 cfg.IngressRoutes() 而不是 ActiveRoutes()：
 // 前者会把启用鉴权的路由替换成鉴权代理地址，后者会直接暴露源站端口
 // ——那等于认证不生效，而且不会有任何报错。
+//
+// 但仅仅"替换成代理地址"还不够：代理可能根本没起来、或该端口被别的进程占用。
+// 因此改走 ingress.BuildRulesForConfig，它在推送前会做带身份的就绪校验，
+// 未就绪直接报错、不推送。
 func pushIngress(client *cfapi.Client, ctx context.Context, cfg *config.Config) error {
-	var rules []cfapi.IngressRule
-	for _, r := range cfg.IngressRoutes() {
-		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+	rules, err := ingress.BuildRulesForConfig(cfg)
+	if err != nil {
+		return err
 	}
 	return client.PushIngressConfig(ctx, cfg.ActiveTunnelID(), rules)
 }

@@ -45,6 +45,7 @@ type Proxy struct {
 	listener net.Listener
 	server   *http.Server
 	reverse  *httputil.ReverseProxy
+	port     int // 实际监听端口，创建时确定，供探活端点回报
 }
 
 // New 创建鉴权代理实例，自动探测可用端口（从 target+1 起）。
@@ -89,6 +90,7 @@ func build(cfg Config, ln net.Listener) *Proxy {
 		cfg:      cfg,
 		listener: ln,
 		reverse:  rp,
+		port:     ln.Addr().(*net.TCPAddr).Port,
 	}
 	p.server = &http.Server{Handler: p}
 	return p
@@ -96,7 +98,7 @@ func build(cfg Config, ln net.Listener) *Proxy {
 
 // ListenPort 返回代理实际监听的端口
 func (p *Proxy) ListenPort() int {
-	return p.listener.Addr().(*net.TCPAddr).Port
+	return p.port
 }
 
 // Start 非阻塞启动代理
@@ -114,6 +116,19 @@ func (p *Proxy) Stop() error {
 
 // ServeHTTP 核心路由逻辑
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 探活端点：由代理自身应答。
+	//
+	// 必须放在鉴权判断之前 —— 调用方（启动流程、ingress 推送前校验）用它
+	// 判断"这个端口上是不是我们的代理"，若要求先登录就无法用它做健康检查。
+	// 响应里不含任何凭据，只回报服务身份与端口。
+	if r.URL.Path == HealthPath {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set(ProxyHeader, "authproxy")
+		fmt.Fprintf(w, `{"service":"cftunnelx-authproxy","port":%d}`, p.port)
+		return
+	}
+
 	// WebSocket 升级请求直接透传
 	if isWebSocket(r) {
 		p.reverse.ServeHTTP(w, r)

@@ -627,13 +627,16 @@ func (s *Server) handleTunnelUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 同步 ingress
+	// 同步 ingress。BuildRules 会先确认鉴权代理**真实就绪**（带身份校验），
+	// 未就绪直接返回错误、不推送 —— 否则会把公网流量指向一个可能被
+	// 其它本地服务占用的端口，而且不经认证。
 	if len(tunnel.Routes) > 0 {
-		client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
-		var rules []cfapi.IngressRule
-		for _, r := range tunnel.IngressRoutes() {
-			rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+		rules, rerr := ingress.BuildRules(tunnel)
+		if rerr != nil {
+			writeError(w, 500, rerr.Error())
+			return
 		}
+		client := cfapi.New(cfg.Auth.APIToken, cfg.Auth.AccountID)
 		if err := client.PushIngressConfig(context.Background(), tunnelID, rules); err != nil {
 			writeError(w, 500, err.Error())
 			return
@@ -799,9 +802,10 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 		if body.TunnelID != "" {
 			tunnel := cfg.FindTunnel(body.TunnelID)
 			if tunnel != nil {
-				var rules []cfapi.IngressRule
-				for _, r := range tunnel.IngressRoutes() {
-					rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+				rules, rerr := ingress.BuildRules(tunnel)
+				if rerr != nil {
+					writeError(w, 500, rerr.Error())
+					return
 				}
 				if err := client.PushIngressConfig(ctx, body.TunnelID, rules); err != nil {
 					writeError(w, 500, err.Error())
@@ -920,9 +924,10 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var rules []cfapi.IngressRule
-		for _, r := range tunnel.IngressRoutes() {
-			rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+		rules, rerr := ingress.BuildRules(tunnel)
+		if rerr != nil {
+			writeError(w, 500, rerr.Error())
+			return
 		}
 		if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
 			writeError(w, 500, err.Error())
@@ -2114,9 +2119,9 @@ func ensureWebRemote(cfg *config.Config) error {
 		tunnel.Routes = append(tunnel.Routes, config.RouteConfig{Name: serviceName, Hostname: domain, Service: service, ZoneID: zone.ID, DNSRecordID: recordID})
 	}
 
-	rules := make([]cfapi.IngressRule, 0, len(tunnel.Routes))
-	for _, route := range tunnel.IngressRoutes() {
-		rules = append(rules, cfapi.IngressRule{Hostname: route.Hostname, Service: route.Service})
+	rules, rerr := ingress.BuildRules(tunnel)
+	if rerr != nil {
+		return rerr
 	}
 	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
 		return err
@@ -2182,9 +2187,9 @@ func disableWebRemote(cfg *config.Config, tunnelName, serviceName, domain string
 		}
 	}
 	tunnel.Routes = append(tunnel.Routes[:routeIndex], tunnel.Routes[routeIndex+1:]...)
-	rules := make([]cfapi.IngressRule, 0, len(tunnel.Routes))
-	for _, r := range tunnel.IngressRoutes() {
-		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+	rules, rerr := ingress.BuildRules(tunnel)
+	if rerr != nil {
+		return rerr
 	}
 	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
 		return err
@@ -2587,9 +2592,10 @@ func (s *Server) handleRoutesBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 推送 ingress
-	var rules []cfapi.IngressRule
-	for _, r := range tunnel.IngressRoutes() {
-		rules = append(rules, cfapi.IngressRule{Hostname: r.Hostname, Service: r.Service})
+	rules, rerr := ingress.BuildRules(tunnel)
+	if rerr != nil {
+		writeError(w, 500, rerr.Error())
+		return
 	}
 	if err := client.PushIngressConfig(ctx, tunnel.ID, rules); err != nil {
 		writeError(w, 500, err.Error())
